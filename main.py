@@ -113,6 +113,18 @@ def run_agent_task(sid, text):
 # ============================================================
 
 class AgentRouter(BaseHTTPRequestHandler):
+    def handle(self):
+        """Override handle to suppress common socket errors on disconnect."""
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as e:
+            if "Errno 54" in str(e) or "Errno 32" in str(e):
+                pass
+            else:
+                raise
+
     def log_message(self, format, *args): pass 
 
     def do_GET(self):

@@ -14,7 +14,6 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
-import tools
 from limbs import hub as limbs_hub
 
 log = logging.getLogger("agent")
@@ -360,7 +359,7 @@ def _chat_inner(user_msg, session_key, images=None, on_log=None):
         log.error("[chat] memory retrieve error: %s" % e)
 
     # ... (rest of the loop)
-    tool_defs = tools.get_definitions()
+    tool_defs = limbs_hub.get_definitions()
     ctx = {"owner_id": _owner_id, "workspace": _workspace, "session_key": session_key}
     max_iterations = 20
     t_llm_total = 0
