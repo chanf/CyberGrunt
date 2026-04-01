@@ -73,12 +73,17 @@ def _call_llm(messages, tool_defs):
     # 2. Build request body
     body = {
         "messages": messages,
-        "tools": tool_defs,
-        "max_tokens": provider.get("max_tokens", 8192),
     }
+    
+    if tool_defs:
+        body["tools"] = tool_defs
+        
+    if provider.get("max_tokens"):
+        body["max_tokens"] = provider["max_tokens"]
+        
     # Standard OpenAI requires 'model', but Azure embeds it in the URL
     if provider.get("type") != "azure":
-        body["model"] = provider["model"]
+        body["model"] = provider.get("model", "gpt-3.5-turbo")
         
     extra = provider.get("extra_body", {})
     body.update(extra)
@@ -93,10 +98,12 @@ def _call_llm(messages, tool_defs):
         # Read response body for debugging 400/422 errors
         body_text = ""
         try:
-            body_text = e.read().decode("utf-8", errors="replace")[:500]
+            body_text = e.read().decode("utf-8", errors="replace")[:1000]
         except Exception:
             pass
-        log.error("[llm] HTTP %d: %s" % (e.code, body_text))
+        log.error(f"[llm] HTTP {e.code}: {body_text}")
+        log.error(f"[llm] Request URL: {url}")
+        log.error(f"[llm] Request Body: {json.dumps(body, ensure_ascii=False)[:2000]}")
         raise
 
 

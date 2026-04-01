@@ -1,0 +1,26 @@
+{
+  "models": {
+    "default": "mock",
+    "providers": {
+      "mock": {
+        "type": "openai",
+        "api_key": "fake",
+        "api_base": "http://localhost:9999",
+        "model": "gpt-mock"
+      }
+    }
+  },
+  "messaging": {
+    "api_url": "http://127.0.0.1:8081/api",
+    "token": "test",
+    "guid": "test"
+  },
+  "owner_ids": ["admin"],
+  "workspace": "./workspace",
+  "port": 8081,
+  "debounce_seconds": 0.1,
+  "memory": {
+    "enabled": false
+  },
+  "mcp_servers": {}
+}

@@ -178,6 +178,24 @@ python3 xiaowang.py
 - **asr** -- 语音转文本 API 凭据
 - **mcp_servers** -- MCP 服务器连接配置
 
+## 测试体系
+
+项目拥有一套完整的自动化测试体系，确保核心逻辑的稳定性：
+
+- **单元测试 (Unit Tests)**: 覆盖 Hub、Core Limbs、技能模块。
+- **集成测试 (Integration Tests)**: 模拟 LLM 决策与工具执行闭环。
+- **E2E 测试 (End-to-End)**: 基于 Playwright 模拟真实浏览器交互（包含中文输入法优化验证）。
+
+### 运行测试
+
+```bash
+# 运行所有测试
+./venv/bin/python -m unittest discover tests
+
+# 运行特定 E2E 测试 (需安装 Playwright)
+./venv/bin/python tests/test_e2e_web.py
+```
+
 ## 设计原则
 
 1. **零框架依赖** -- 每一行代码都清晰可见且可调试。无魔法，无隐藏抽象。

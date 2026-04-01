@@ -265,8 +265,6 @@ HTML_UI = r"""
         ui.input.addEventListener('compositionstart', () => { isComposing = true; });
         ui.input.addEventListener('compositionend', () => { isComposing = false; });
 
-        function appendMessage(role, text) {
-
         // --- Persistent Event Connection ---
         function connectEvents() {
             const ev = new EventSource(`/events?sid=${SID}`);
