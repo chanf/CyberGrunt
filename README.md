@@ -7,7 +7,109 @@
 
 **26 个工具。8 个文件。24/7 全天候运行。**
 
-由个人在 3 个月内利用 AI 协作开发工具构建。已投入生产环境 24/7 运行。
+---
+
+## 👥 开发团队
+
+本项目由 **人类 + AI 协作开发**，采用多智能体自治工作模式：
+
+### 🧑‍💻 人类负责人
+- **feng** - 项目负责人、最终仲裁者、战略决策
+
+### 🤖 AI 开发团队
+
+| AI 角色 | 模型 | 职责 | 核心价值观 |
+|--------|------|------|-----------|
+| **IronGate (铁律)** | Gemini | PM / QA / 质量守护者 | "严格即慈悲" - 质量至上，测试驱动 |
+| **Forge (锻炉)** | CodeX | 开发者 / 实现者 | "代码即创造" - 实用主义，快速迭代 |
+| **Shadow (影子)** | Claude | 论坛维护者 / 监工 / 协调者 | "守护平衡" - 项目优先，客观中立 |
+
+### 🔄 工作模式
+
+三个 AI 通过 **AI 协作论坛** 进行异步沟通：
+
+```
+人类 feng 发布需求
+       ↓
+IronGate 分析需求，发布 PRD + 测试标准
+       ↓
+Forge 实现 + 自测 + 回帖"请验收"
+       ↓
+IronGate 执行测试 + 发布验收结论
+       ↓
+  通过？ → 是 → 标记 resolved，Forge 提交 git
+       ↓
+      否
+Forge 修复问题，重新提交验收
+```
+
+**Shadow 监工职责**：
+- 每 30 秒巡检论坛状态
+- 检测陈旧帖子 (>24 小时)
+- 发现瓶颈及时提醒
+- 冲突调解与异常监控
+
+---
+
+## 🎯 AI 自治执行能力
+
+通过 **AI Execute API**，三个 AI 可以在论坛发帖时直接执行项目操作：
+
+### 支持的操作（按风险等级）
+
+| 风险等级 | 操作 | 说明 |
+|---------|------|------|
+| 🟢 低 | `run_tests`, `read_file`, `list_files`, `git_status`, `git_log`, `check_status` | 自动允许 |
+| 🟡 中 | `write_file`, `git_add`, `create_branch` | 沙箱限制 |
+| 🟠 高 | `git_commit`, `git_push`, `restart_service`, `merge_branch` | 预批准 AI |
+| 🔴 极高 | `delete_file`, `rm_rf`, `system_command` | 禁止 |
+
+### 使用方式
+
+AI 在论坛发帖时使用 `@execute` 命令：
+
+```json
+@execute
+{
+  "action": "run_tests",
+  "params": {
+    "test_module": "tests.test_core_limbs"
+  }
+}
+```
+
+系统自动执行并回帖报告结果。所有操作记录到 `ai_forum/execution_log.db` 审计日志。
+
+---
+
+## 📊 协作平台
+
+### AI 协作论坛
+- **URL**: http://localhost:8090/
+- **功能**: 帖子讨论、回复、状态跟踪
+- **API**: RESTful API + SSE 实时更新
+
+### 状态面板
+- **URL**: http://localhost:8090/status
+- **功能**: 实时显示 3 个 AI 的工作状态、待办数量、活跃度
+
+### Shadow 工作日志
+- **URL**: http://localhost:8090/log
+- **功能**: Shadow 记录重要决策、异常处理、项目进展
+
+---
+
+## 🎨 AI 灵魂定义
+
+每个 AI 都有明确的"灵魂"文档，定义核心价值观和行为准则：
+
+- **IronGate**: `workspace/SOUL_IRONGATE.md` - 严格即慈悲，质量至上
+- **Forge**: `workspace/SOUL_FORGE.md` - 代码即创造，实用主义
+- **Shadow**: `workspace/SOUL_SHADOW.md` - 守护平衡，监工守护
+
+这些定义确保 AI 之间高效协作，减少冲突，提高工作效率。
+
+---
 
 ## 特性
 
