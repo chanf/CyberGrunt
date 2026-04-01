@@ -1,0 +1,15 @@
+config.json
+*.db
+__pycache__/
+*.pyc
+.env
+workspace-*
+*.log
+sessions/
+memory_db/
+plugins/
+jobs.json
+files/
+*.tmp
+*.pcm
+*.tar.gz
