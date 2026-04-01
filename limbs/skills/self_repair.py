@@ -21,6 +21,7 @@ _plugins_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.p
 _CLEANUP_SUFFIXES = (".log", ".tmp", ".cache", ".old", ".db-wal", ".db-shm")
 _DEFAULT_DISK_THRESHOLD_MB = 1024
 _DEFAULT_CLEANUP_LIMIT_MB = 256
+_SELF_REPAIR_HISTORY_FILE = "self_repair_history.jsonl"
 
 
 def _project_root(ctx: Dict[str, Any]) -> str:
@@ -31,6 +32,23 @@ def _project_root(ctx: Dict[str, Any]) -> str:
 def _safe_disk_usage(path: str) -> Tuple[int, int, int]:
     usage = shutil.disk_usage(path)
     return int(usage.total), int(usage.used), int(usage.free)
+
+
+def _history_path(ctx: Dict[str, Any]) -> str:
+    workspace = os.path.abspath(ctx.get("workspace", "."))
+    return os.path.join(workspace, "files", _SELF_REPAIR_HISTORY_FILE)
+
+
+def _append_history_record(ctx: Dict[str, Any], record: Dict[str, Any]) -> Tuple[str, str]:
+    """Append one JSON line record. Returns (path, error_message)."""
+    history_path = _history_path(ctx)
+    try:
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        with open(history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return history_path, ""
+    except Exception as exc:
+        return history_path, str(exc)
 
 
 def _collect_cleanup_candidates(ctx: Dict[str, Any]) -> List[Tuple[float, str, int]]:
@@ -285,6 +303,47 @@ def tool_self_repair_loop(args, ctx):
     # Post diagnostics
     post_diag = tool_diagnose({"target": "all"}, ctx)
 
+    trigger_reasons = []
+    if disk_result["triggered"]:
+        trigger_reasons.append("disk_low")
+    if mcp_result["offline_before"]:
+        trigger_reasons.append("mcp_offline")
+    if force_mcp_reconnect:
+        trigger_reasons.append("forced_mcp_reconnect")
+    if not trigger_reasons:
+        trigger_reasons.append("routine")
+
+    repair_record = {
+        "ts": datetime.now(CST).isoformat(timespec="seconds"),
+        "trigger_reasons": trigger_reasons,
+        "params": {
+            "disk_free_mb_threshold": threshold_mb,
+            "cleanup_limit_mb": cleanup_limit_mb,
+            "force_mcp_reconnect": force_mcp_reconnect,
+        },
+        "actions": {
+            "disk_cleanup": {
+                "triggered": disk_result["triggered"],
+                "free_before_mb": disk_result["free_before_mb"],
+                "free_after_mb": disk_result["free_after_mb"],
+                "deleted_count": disk_result["deleted_count"],
+                "reclaimed_mb": disk_result["reclaimed_mb"],
+                "deleted_files": disk_result["deleted_files"],
+                "errors": disk_result["errors"],
+            },
+            "mcp_reconnect": {
+                "attempted": mcp_result["attempted"],
+                "offline_before": mcp_result["offline_before"],
+                "offline_after": mcp_result["offline_after"],
+                "added": mcp_result["added"],
+                "removed": mcp_result["removed"],
+                "total": mcp_result["total"],
+                "error": mcp_result["error"],
+            },
+        },
+    }
+    history_path, history_error = _append_history_record(ctx, repair_record)
+
     lines = []
     lines.append("== Self Repair Loop ==")
     lines.append("Time: %s" % datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S CST"))
@@ -347,10 +406,73 @@ def tool_self_repair_loop(args, ctx):
     else:
         lines.append("MCP reconnect skipped: no offline stdio server detected.")
 
+    if history_error:
+        lines.append("History write failed: %s (%s)" % (history_path, history_error))
+    else:
+        lines.append("History recorded: %s" % history_path)
+
     lines.append("")
     lines.append("== Diagnose (After) ==")
     lines.append(post_diag)
     return "\n".join(lines)
+
+
+@limb(
+    "self_repair_history",
+    "Read recent self-repair history records for effectiveness analysis.",
+    {
+        "limit": {
+            "type": "integer",
+            "description": "How many recent records to read (default 20, max 200).",
+        }
+    },
+)
+def tool_self_repair_history(args, ctx):
+    limit = max(1, min(int(args.get("limit", 20)), 200))
+    history_path = _history_path(ctx)
+    if not os.path.exists(history_path):
+        return "No self-repair history yet. Expected path: %s" % history_path
+
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+    except Exception as exc:
+        return "[error] failed to read self-repair history: %s" % exc
+
+    if not lines:
+        return "No self-repair history yet. Expected path: %s" % history_path
+
+    selected = lines[-limit:]
+    parsed = []
+    for line in selected:
+        try:
+            parsed.append(json.loads(line))
+        except Exception:
+            continue
+
+    if not parsed:
+        return "[error] self-repair history file contains no valid JSON records."
+
+    out = []
+    out.append("Self-repair history (%d/%d): %s" % (len(parsed), len(lines), history_path))
+    for rec in reversed(parsed):
+        ts = rec.get("ts", "?")
+        reasons = ",".join(rec.get("trigger_reasons", [])) or "unknown"
+        disk = rec.get("actions", {}).get("disk_cleanup", {})
+        mcp = rec.get("actions", {}).get("mcp_reconnect", {})
+        out.append(
+            "- %s | reasons=%s | disk(trigger=%s reclaimed=%sMB deleted=%s) | mcp(attempted=%s error=%s)"
+            % (
+                ts,
+                reasons,
+                disk.get("triggered", False),
+                disk.get("reclaimed_mb", 0),
+                disk.get("deleted_count", 0),
+                mcp.get("attempted", False),
+                "yes" if mcp.get("error") else "no",
+            )
+        )
+    return "\n".join(out)
 
 @limb("create_tool", "Create a new custom tool plugin. Code is hot-loaded immediately. Persists across restarts. Use @limb decorator in code to register tools.",
       {"name": {"type": "string", "description": "Tool name (e.g. 'weather')"},

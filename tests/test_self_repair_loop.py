@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import sys
@@ -83,6 +84,42 @@ class TestSelfRepairLoop(unittest.TestCase):
         self.assertIn("Disk cleanup skipped", report)
         self.assertIn("MCP reconnect skipped", report)
         mock_reload_mcp.assert_not_called()
+
+    @patch("limbs.skills.self_repair.shutil.disk_usage")
+    def test_writes_repair_history_record(self, mock_disk_usage):
+        usage = namedtuple("usage", ["total", "used", "free"])
+        mock_disk_usage.return_value = usage(10 * 1024**3, 4 * 1024**3, 6 * 1024**3)
+
+        with patch("mcp_client._servers", {}):
+            report = self_repair.tool_self_repair_loop({}, self.ctx)
+
+        history_path = os.path.join(self.workspace, "files", "self_repair_history.jsonl")
+        self.assertTrue(os.path.exists(history_path))
+        self.assertIn("History recorded", report)
+
+        with open(history_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+
+        rec = json.loads(lines[0])
+        self.assertIn("ts", rec)
+        self.assertIn("trigger_reasons", rec)
+        self.assertIn("actions", rec)
+        self.assertIn("disk_cleanup", rec["actions"])
+        self.assertIn("mcp_reconnect", rec["actions"])
+
+    @patch("limbs.skills.self_repair.shutil.disk_usage")
+    def test_reads_repair_history_summary(self, mock_disk_usage):
+        usage = namedtuple("usage", ["total", "used", "free"])
+        mock_disk_usage.return_value = usage(10 * 1024**3, 4 * 1024**3, 6 * 1024**3)
+
+        with patch("mcp_client._servers", {}):
+            self_repair.tool_self_repair_loop({}, self.ctx)
+            self_repair.tool_self_repair_loop({}, self.ctx)
+
+        summary = self_repair.tool_self_repair_history({"limit": 1}, self.ctx)
+        self.assertIn("Self-repair history", summary)
+        self.assertIn("reasons=", summary)
 
 
 if __name__ == "__main__":

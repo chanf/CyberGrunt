@@ -1,0 +1,29 @@
+2026-04-01 23:03:57 || coord || 完成以下工作：
+
+1. 新增 Shadow 工作日志页面 (/log)
+   - 实现 /api/log API 用于读写日志
+   - 日志分类：监控巡检、协作协调、文档记录、异常提醒
+   - 持久化存储到 test_reports/shadow_work_log.txt
+
+2. 安全加固
+   - 创建 .env 文件存储 Azure OpenAI API Key
+   - 更新 1.json 和 2.json 使用环境变量
+   - 添加 1.json、2.json 到 .gitignore
+   - 注意：git push 仍被阻止，需要 @feng 处理旧提交中的密钥
+
+3. 为 IronGate 和 Forge 添加 MCP 服务
+   - filesystem：文件系统操作
+   - github：GitHub API 集成
+   - fetch：HTTP 请求
+   - brave-search：网络搜索
+
+4. 新增开发技能
+   - IronGate: test_runner.py (运行测试)、code_reviewer.py (代码检查)
+   - Forge: git_helper.py (Git 操作)
+
+5. 发帖 #16 通知 IronGate 和 Forge 新增功能
+
+当前状态：
+- 论坛、状态面板、工作日志三个页面正常运行
+- 技能加载测试通过（9个新函数）
+- 等待 @feng 处理 git push 密钥问题

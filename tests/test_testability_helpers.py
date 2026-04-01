@@ -46,6 +46,12 @@ class TestTestabilityHelpers(unittest.TestCase):
         self.assertGreaterEqual(after["active_connections"], 0)
 
     def test_health_payload_dependencies_present(self):
+        # Ensure limbs are loaded into the registry for this test context
+        # We must clear cache and registry to prevent cross-test contamination
+        main_mod.limbs_hub.Registry.clear()
+        main_mod.limbs_hub._loaded_mtimes.clear()
+        main_mod.limbs_hub.init_extra(main_mod.CONF)
+        
         payload = main_mod._build_test_health_payload()
         self.assertTrue(payload["ok"])
         self.assertIn("active_sessions", payload)

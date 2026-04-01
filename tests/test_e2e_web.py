@@ -56,7 +56,7 @@ class TestWebE2E(unittest.TestCase):
 
             page.screenshot(path="screen/01_page_loaded.png")
 
-            input_box = page.locator("#userInput")
+            input_box = page.get_by_test_id("chat-input")
             input_box.fill("你好")
 
             # 1. Start composition (IME active)
@@ -67,7 +67,7 @@ class TestWebE2E(unittest.TestCase):
             input_box.press("Enter")
 
             # 3. Check that NO user bubble appeared
-            bubbles = page.locator(".bubble.user")
+            bubbles = page.get_by_test_id("chat-bubble-user")
             self.assertEqual(bubbles.count(), 0, "Message should NOT be sent during composition")
             page.screenshot(path="screen/03_enter_pressed_during_ime.png")
 
