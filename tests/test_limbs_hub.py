@@ -4,7 +4,7 @@ import sys
 import json
 from unittest.mock import MagicMock, patch
 
-# Add project root to path so we can import limbs
+# Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import limbs.hub as hub
@@ -13,8 +13,8 @@ from limbs.hub import limb
 class TestLimbsHub(unittest.TestCase):
 
     def setUp(self):
-        # Clear registry before each test
-        hub._registry = {}
+        # Clear registry before each test via the new Registry class
+        hub.Registry.clear()
 
     def test_limb_registration(self):
         """Test if the @limb decorator correctly registers tools."""
@@ -22,8 +22,8 @@ class TestLimbsHub(unittest.TestCase):
         def my_test_fn(args, ctx):
             return f"Hello {args['param1']}"
 
-        self.assertIn("test_tool", hub._registry)
-        definition = hub._registry["test_tool"]["definition"]
+        self.assertIsNotNone(hub.Registry.get("test_tool"))
+        definition = hub.Registry.get("test_tool")["definition"]
         self.assertEqual(definition["function"]["name"], "test_tool")
         self.assertEqual(definition["function"]["description"], "A test tool")
         self.assertIn("param1", definition["function"]["parameters"]["properties"])

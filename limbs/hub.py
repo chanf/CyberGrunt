@@ -13,13 +13,37 @@ import mcp_client
 
 log = logging.getLogger("agent")
 
-_registry = {}  # name -> {"fn", "definition"}
+# Singleton-like registry to prevent accidental overwrites during hot-reloads
+class Registry:
+    _data = {}
+    
+    @classmethod
+    def set(cls, name, entry):
+        cls._data[name] = entry
+        
+    @classmethod
+    def get(cls, name):
+        return cls._data.get(name)
+        
+    @classmethod
+    def items(cls):
+        return cls._data.items()
+    
+    @classmethod
+    def clear(cls):
+        cls._data.clear()
+
 _extra_config = {}
+_loaded_mtimes = {} # path -> mtime
+
+# Directories
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PLUGINS_DIR = os.path.join(PROJECT_ROOT, "plugins")
 
 def limb(name, description, properties, required=None):
     """Decorator: register a function as a limb (tool)"""
     def decorator(fn):
-        _registry[name] = {
+        Registry.set(name, {
             "fn": fn,
             "definition": {
                 "type": "function",
@@ -33,7 +57,7 @@ def limb(name, description, properties, required=None):
                     },
                 },
             },
-        }
+        })
         return fn
     return decorator
 
@@ -42,7 +66,7 @@ tool = limb
 
 def get_definitions():
     """Return all registered limb definitions including MCP tools"""
-    defs = [entry["definition"] for entry in _registry.values()]
+    defs = [entry["definition"] for name, entry in Registry.items()]
     # Add MCP tools
     try:
         defs.extend(mcp_client.get_all_tool_defs())
@@ -55,7 +79,7 @@ def execute(name, args, ctx):
     log.info(f"[limb] {name}({json.dumps(args, ensure_ascii=False)[:200]})")
     
     # 1. Try local registry
-    entry = _registry.get(name)
+    entry = Registry.get(name)
     if entry:
         try:
             return entry["fn"](args, ctx)
@@ -74,38 +98,57 @@ def execute(name, args, ctx):
     return f"[error] unknown tool: {name}"
 
 def load_all():
-    """Dynamically discover and load limbs from core/ and skills/"""
+    """Dynamically discover and load limbs from core/, skills/, and plugins/"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
+    # 1. Load internal limbs (core, skills, mcp)
     for category in ["core", "skills", "mcp"]:
         cat_dir = os.path.join(base_dir, category)
-        if not os.path.exists(cat_dir):
+        if os.path.exists(cat_dir):
+            _load_from_dir(cat_dir, f"limbs.{category}")
+
+    # 2. Load external plugins from root /plugins directory
+    if os.path.exists(PLUGINS_DIR):
+        _load_from_dir(PLUGINS_DIR, "plugins", is_plugin=True)
+
+def _load_from_dir(directory, package_prefix, is_plugin=False):
+    """Scan directory and load python modules."""
+    for item in os.listdir(directory):
+        if item.startswith("__") or item.startswith(".") or not item.endswith(".py"):
             continue
             
-        for item in os.listdir(cat_dir):
-            if item.startswith("__") or item.startswith("."):
-                continue
-                
-            module_name = None
-            file_path = None
+        file_path = os.path.join(directory, item)
+        mtime = os.path.getmtime(file_path)
+        
+        # Incremental loading: skip if not changed
+        if _loaded_mtimes.get(file_path) == mtime:
+            continue
             
-            if item.endswith(".py"):
-                module_name = f"limbs.{category}.{item[:-3]}"
-                file_path = os.path.join(cat_dir, item)
-            elif os.path.isdir(os.path.join(cat_dir, item)):
-                if os.path.exists(os.path.join(cat_dir, item, "__init__.py")):
-                    module_name = f"limbs.{category}.{item}"
-                    file_path = os.path.join(cat_dir, item, "__init__.py")
+        module_name = f"{package_prefix}.{item[:-3]}"
+        
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                code = f.read()
             
-            if module_name and file_path:
-                try:
-                    spec = importlib.util.spec_from_file_location(module_name, file_path)
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = module
-                    spec.loader.exec_module(module)
-                    log.info(f"[hub] Loaded {category} limb: {module_name}")
-                except Exception as e:
-                    log.error(f"[hub] Failed to load {module_name}: {e}")
+            # Use a fresh namespace for each load to guarantee reload
+            namespace = {
+                "__name__": module_name,
+                "__file__": file_path,
+                "limb": limb,
+                "tool": limb,
+                "log": log,
+                "os": os,
+                "json": json,
+                "sys": sys
+            }
+            
+            # Execute the code in the namespace
+            exec(compile(code, file_path, 'exec'), namespace)
+            
+            _loaded_mtimes[file_path] = mtime
+            log.info(f"[hub] Loaded {module_name} (Hot-reload: {file_path in _loaded_mtimes})")
+        except Exception as e:
+            log.error(f"[hub] Failed to load {module_name}: {e}", exc_info=True)
 
 def init_extra(config):
     """Initialize with config and load all limbs + MCP servers"""
@@ -122,6 +165,5 @@ def init_extra(config):
 
 def reload_mcp():
     """Hot-reload MCP configuration"""
-    # This will be called by the reload_mcp limb
     added, removed, total = mcp_client.reload(_extra_config)
     return added, removed, total

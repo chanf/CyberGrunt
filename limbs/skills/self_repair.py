@@ -13,7 +13,7 @@ import limbs.hub as hub
 log = logging.getLogger("agent")
 CST = timezone(timedelta(hours=8))
 
-# Plugin directory: plugins/ next to the hub
+# Plugin directory: root plugins/
 _plugins_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "plugins")
 
 @limb("self_check", "System self-check: collect today's conversation stats, system health, "
@@ -105,7 +105,7 @@ def tool_diagnose(args, ctx):
             
     return "\n".join(report)
 
-@limb("create_tool", "Create a new custom tool plugin. hot-loaded immediately. Persists across restarts.",
+@limb("create_tool", "Create a new custom tool plugin. Code is hot-loaded immediately. Persists across restarts. Use @limb decorator in code to register tools.",
       {"name": {"type": "string", "description": "Tool name (e.g. 'weather')"},
        "code": {"type": "string", "description": "Complete Python code with @limb decorator"}},
       ["name", "code"])
@@ -114,21 +114,66 @@ def tool_create_tool(args, ctx):
     code = args["code"]
     
     if not name.replace("_", "").isalnum():
-        return "[error] Invalid tool name"
+        return "[error] Invalid tool name (letters, digits, underscores only)"
     
     os.makedirs(_plugins_dir, exist_ok=True)
     fpath = os.path.join(_plugins_dir, f"{name}.py")
     
     try:
-        # Save and try to load
+        # Save code
         with open(fpath, "w", encoding="utf-8") as f:
             f.write(code)
         
-        # In a real system we'd use importlib to hot-load here
-        # For now, just note it's saved.
-        return f"Tool '{name}' created at {fpath}. It will be loaded on next restart or via hot-reload."
+        # Trigger Hot-reload in hub
+        hub.load_all()
+        
+        # Verify if it was actually registered
+        if hub.Registry.get(name):
+            return f"Custom tool '{name}' created and hot-loaded successfully."
+        else:
+            return f"Tool code saved to {fpath}, but failed to register. Check logs for syntax errors."
     except Exception as e:
         return f"[error] Failed to create tool: {e}"
+
+@limb("list_custom_tools", "List all custom tool plugins in plugins/ directory", {})
+def tool_list_custom_tools(args, ctx):
+    if not os.path.isdir(_plugins_dir):
+        return "No custom tools directory found."
+    
+    plugins = [f for f in sorted(os.listdir(_plugins_dir)) if f.endswith(".py")]
+    if not plugins:
+        return "No custom tools yet."
+    
+    lines = ["Custom tools (%d):" % len(plugins)]
+    for fname in plugins:
+        tool_name = fname[:-3]
+        fpath = os.path.join(_plugins_dir, fname)
+        size = os.path.getsize(fpath)
+        status = "active" if hub.Registry.get(tool_name) else "error/not loaded"
+        lines.append(f"  - {tool_name} ({status}, {size} bytes)")
+    return "\n".join(lines)
+
+@limb("remove_tool", "Delete a custom tool plugin. Persists across restarts.",
+      {"name": {"type": "string", "description": "Tool name to delete"}},
+      ["name"])
+def tool_remove_tool(args, ctx):
+    name = args["name"]
+    fpath = os.path.join(_plugins_dir, f"{name}.py")
+    
+    if not os.path.exists(fpath):
+        return f"[error] Custom tool '{name}' not found."
+    
+    try:
+        os.remove(fpath)
+        # Registry update happens during next load or manually here
+        if hub.Registry.get(name):
+            # Since we can't easily "unregister" without a Registry.delete method
+            # We'll just rely on Registry.clear() if needed, but for now 
+            # let's just delete from internal data
+            del hub.Registry._data[name]
+        return f"Deleted custom tool '{name}'."
+    except Exception as e:
+        return f"[error] Failed to remove tool: {e}"
 
 @limb("reload_mcp", "Hot-reload MCP servers from config.json", {})
 def tool_reload_mcp(args, ctx):
