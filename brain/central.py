@@ -15,6 +15,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 
 import tools
+from limbs import hub as limbs_hub
 
 log = logging.getLogger("agent")
 CST = timezone(timedelta(hours=8))
@@ -411,4 +412,3 @@ def _chat_inner(user_msg, session_key, images=None, on_log=None):
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
 
     return "Processing timed out (max iterations reached)."
-ations reached)."

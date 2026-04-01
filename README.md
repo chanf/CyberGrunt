@@ -1,6 +1,9 @@
 # CyberGrunt (赛博牛马) -- 自进化 AI 智能体系统
 
-这是一个在生产环境运行的 AI 智能体，使用 **约 3,500 行纯 Python 代码** 构建，**零框架依赖**。没有 LangChain，没有 LlamaIndex，没有 CrewAI -- 仅使用标准库 + 3 个轻量级包（`croniter`, `lancedb`, `websocket-client`）。
+> **注**：本项目基于 [wangziqi06/724-office](https://github.com/wangziqi06/724-office) 衍生并深度重构。感谢原作者提供的高质量核心代码参考。
+
+这是一个在生产环境运行的 AI 智能体，使用 **约 3,500 行纯 Python 代码** 构建，**零框架依赖**。
+没有 LangChain，没有 LlamaIndex，没有 CrewAI -- 仅使用标准库 + 3 个轻量级包（`croniter`, `lancedb`, `websocket-client`）。
 
 **26 个工具。8 个文件。24/7 全天候运行。**
 

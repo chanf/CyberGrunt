@@ -44,6 +44,8 @@ DIRS = {
 for d in DIRS.values(): os.makedirs(d, exist_ok=True)
 
 # Modules Initialization
+import messaging
+import scheduler
 from brain import central as llm
 from brain import memory as mem_mod
 from limbs import hub as limbs_hub
@@ -327,4 +329,3 @@ HTML_UI = r"""
 
 if __name__ == "__main__":
     main()
-)
