@@ -4,6 +4,8 @@ import time
 import os
 import signal
 import sys
+import urllib.request
+import json
 from playwright.sync_api import sync_playwright
 
 class TestWebE2E(unittest.TestCase):
@@ -39,35 +41,53 @@ class TestWebE2E(unittest.TestCase):
 
     def test_chinese_ime_support(self):
         """Verify that Enter does not send message while composing (IME)."""
+        os.makedirs("screen", exist_ok=True)
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto("http://localhost:8081")
-            
+
+            page.screenshot(path="screen/01_page_loaded.png")
+
             input_box = page.locator("#userInput")
             input_box.fill("你好")
-            
+
             # 1. Start composition (IME active)
             input_box.evaluate("el => el.dispatchEvent(new CompositionEvent('compositionstart'))")
-            
+            page.screenshot(path="screen/02_ime_composing.png")
+
             # 2. Press Enter
             input_box.press("Enter")
-            
-            # 3. Check that NO user bubble appeared (except maybe initial empty ones if any)
+
+            # 3. Check that NO user bubble appeared
             bubbles = page.locator(".bubble.user")
             self.assertEqual(bubbles.count(), 0, "Message should NOT be sent during composition")
-            
+            page.screenshot(path="screen/03_enter_pressed_during_ime.png")
+
             # 4. End composition
             input_box.evaluate("el => el.dispatchEvent(new CompositionEvent('compositionend'))")
-            
+
             # 5. Press Enter again
             input_box.press("Enter")
-            
+
             # 6. Now it should be sent
             bubbles.last.wait_for(state="visible", timeout=2000)
             self.assertEqual(bubbles.count(), 1, "Message should be sent after composition ends")
-            
+            page.screenshot(path="screen/04_message_sent_successfully.png")
+
             browser.close()
+
+    def test_test_health_endpoint_contract(self):
+        with urllib.request.urlopen("http://localhost:8081/api/test/health", timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        self.assertTrue(payload.get("ok"))
+        self.assertIn("active_sessions", payload)
+        self.assertIn("loaded_limbs", payload)
+        self.assertIn("recent_error", payload)
+        self.assertIsInstance(payload["active_sessions"], int)
+        self.assertIsInstance(payload["loaded_limbs"], list)
+        self.assertIn("exec", payload["loaded_limbs"])
 
 if __name__ == "__main__":
     unittest.main()
