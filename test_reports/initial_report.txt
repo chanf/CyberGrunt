@@ -1,0 +1,13 @@
+...........[limb] fail error: Something went wrong
+Traceback (most recent call last):
+  File "/Users/feng/Work/724-office/limbs/hub.py", line 61, in execute
+    return entry["fn"](args, ctx)
+           ~~~~~~~~~~~^^^^^^^^^^^
+  File "/Users/feng/Work/724-office/tests/test_limbs_hub.py", line 51, in fail_fn
+    raise ValueError("Something went wrong")
+ValueError: Something went wrong
+................
+----------------------------------------------------------------------
+Ran 27 tests in 1.044s
+
+OK

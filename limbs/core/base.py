@@ -14,9 +14,17 @@ import scheduler
 log = logging.getLogger("agent")
 
 def _resolve_path(path, workspace):
-    if os.path.isabs(path):
-        return path
-    return os.path.join(workspace, path)
+    """
+    Securely resolve path and ensure it stays within the workspace.
+    Returns absolute path or raises PermissionError.
+    """
+    abs_workspace = os.path.abspath(workspace)
+    # Join and resolve symlinks/relative parts
+    target_path = os.path.abspath(os.path.join(abs_workspace, path))
+    
+    if not target_path.startswith(abs_workspace):
+        raise PermissionError(f"Access denied: path '{path}' is outside workspace")
+    return target_path
 
 def _split_message(text, max_bytes=1800):
     if len(text.encode("utf-8")) <= max_bytes:
@@ -74,15 +82,17 @@ def tool_message(args, ctx):
       {"path": {"type": "string", "description": "File path (relative to workspace or absolute)"}},
       ["path"])
 def tool_read_file(args, ctx):
-    fpath = _resolve_path(args["path"], ctx["workspace"])
     try:
+        fpath = _resolve_path(args["path"], ctx["workspace"])
         with open(fpath, "r", encoding="utf-8") as f:
             content = f.read()
         if len(content) > 10000:
             content = content[:10000] + f"\n... (truncated, total {len(content)} chars)"
         return content or "(empty file)"
+    except PermissionError as e:
+        return f"[error] {e}"
     except FileNotFoundError:
-        return f"[error] file not found: {fpath}"
+        return f"[error] file not found: {args['path']}"
     except Exception as e:
         return f"[error] {e}"
 
@@ -91,12 +101,14 @@ def tool_read_file(args, ctx):
        "content": {"type": "string", "description": "File content"}},
       ["path", "content"])
 def tool_write_file(args, ctx):
-    fpath = _resolve_path(args["path"], ctx["workspace"])
     try:
+        fpath = _resolve_path(args["path"], ctx["workspace"])
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
         with open(fpath, "w", encoding="utf-8") as f:
             f.write(args["content"])
-        return f"Written to {fpath} ({len(args['content'])} chars)"
+        return f"Written to {args['path']} ({len(args['content'])} chars)"
+    except PermissionError as e:
+        return f"[error] {e}"
     except Exception as e:
         return f"[error] {e}"
 
@@ -107,18 +119,20 @@ def tool_write_file(args, ctx):
        "new": {"type": "string", "description": "Replacement text"}},
       ["path", "old", "new"])
 def tool_edit_file(args, ctx):
-    fpath = _resolve_path(args["path"], ctx["workspace"])
     try:
+        fpath = _resolve_path(args["path"], ctx["workspace"])
         with open(fpath, "r", encoding="utf-8") as f:
             content = f.read()
         if args["old"] not in content:
-            return f"[error] old string not found in {fpath}"
+            return f"[error] old string not found in {args['path']}"
         content = content.replace(args["old"], args["new"], 1)
         with open(fpath, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Edited {fpath}"
+        return f"Edited {args['path']}"
+    except PermissionError as e:
+        return f"[error] {e}"
     except FileNotFoundError:
-        return f"[error] file not found: {fpath}"
+        return f"[error] file not found: {args['path']}"
     except Exception as e:
         return f"[error] {e}"
 
