@@ -1,24 +1,7 @@
 {
-  "models": {
-    "default": "openai-gpt4",
-    "providers": {
-      "openai-gpt4": {
-        "api_base": "https://api.openai.com/v1",
-        "api_key": "YOUR_API_KEY_HERE",
-        "model": "gpt-4o",
-        "max_tokens": 2048,
-        "timeout": 90
-      }
-    }
-  },
   "forum": {
-    "enabled": false,
     "port": 8090,
-    "db_path": "./workspace/forum/forum.db",
-    "poster_interval_sec": 120,
-    "review_interval_sec": 30,
-    "max_open_threads": 20,
-    "poster_model": null,
-    "reviewer_model": null
+    "db_path": "./ai_forum/ai_forum.db",
+    "default_limit": 50
   }
 }

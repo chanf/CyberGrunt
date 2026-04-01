@@ -9,39 +9,64 @@ from ai_forum.forum_store import ForumStore
 class TestForumStore(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self.db_path = os.path.join(self.tmpdir, "forum.db")
-        self.store = ForumStore(self.db_path)
+        self.store = ForumStore(os.path.join(self.tmpdir, "forum.db"))
 
     def tearDown(self):
         self.store.close()
         shutil.rmtree(self.tmpdir)
 
-    def test_create_thread_and_reviewer_reply_status_transition(self):
-        thread = self.store.create_thread("开发进展 A", "正在重构模块 A")
-        self.assertEqual(thread["status"], "open")
-        self.assertEqual(self.store.count_open_threads(), 1)
+    def test_thread_status_pending_and_resolved(self):
+        thread = self.store.create_thread(
+            title="开发任务A",
+            body="实现接口A并补测试",
+            author="developer_ai",
+        )
+        self.assertEqual(thread["status"], "pending")
 
-        reply = self.store.create_reply(thread_id=thread["id"], body="请补充回归测试", author="reviewer_ai")
-        self.assertEqual(reply["thread_id"], thread["id"])
+        updated = self.store.set_thread_status(
+            thread_id=thread["id"],
+            status="resolved",
+            updated_by="developer_ai",
+        )
+        self.assertEqual(updated["status"], "resolved")
+        self.assertEqual(updated["updated_by"], "developer_ai")
 
-        updated = self.store.get_thread(thread["id"])
-        self.assertEqual(updated["status"], "replied")
-        self.assertEqual(len(updated["replies"]), 1)
-        self.assertEqual(updated["replies"][0]["author"], "reviewer_ai")
-        self.assertEqual(self.store.count_open_threads(), 0)
+    def test_actionable_rule_by_last_actor(self):
+        thread = self.store.create_thread(
+            title="需要产品确认验收口径",
+            body="请确认这次验收是否包含弱网场景",
+            author="developer_ai",
+        )
 
-    def test_get_oldest_open_thread(self):
-        t1 = self.store.create_thread("T1", "B1")
-        t2 = self.store.create_thread("T2", "B2")
+        # 新帖由 developer_ai 发起，reviewer_ai 需要回复，developer_ai 不需要立即自回
+        dev_actionable = self.store.list_actionable_threads(author="developer_ai")
+        rev_actionable = self.store.list_actionable_threads(author="reviewer_ai")
+        self.assertEqual(len(dev_actionable), 0)
+        self.assertEqual(len(rev_actionable), 1)
+        self.assertEqual(rev_actionable[0]["id"], thread["id"])
 
-        oldest = self.store.get_oldest_open_thread()
-        self.assertIsNotNone(oldest)
-        self.assertEqual(oldest["id"], t1["id"])
+        self.store.create_reply(
+            thread_id=thread["id"],
+            author="reviewer_ai",
+            body="验收要包含弱网和超时重试场景。",
+        )
 
-        self.store.create_reply(thread_id=t1["id"], body="done", author="reviewer_ai")
-        oldest = self.store.get_oldest_open_thread()
-        self.assertIsNotNone(oldest)
-        self.assertEqual(oldest["id"], t2["id"])
+        # reviewer 回帖后，developer 需要响应
+        dev_actionable = self.store.list_actionable_threads(author="developer_ai")
+        rev_actionable = self.store.list_actionable_threads(author="reviewer_ai")
+        self.assertEqual(len(dev_actionable), 1)
+        self.assertEqual(dev_actionable[0]["id"], thread["id"])
+        self.assertEqual(len(rev_actionable), 0)
+
+        self.store.set_thread_status(
+            thread_id=thread["id"],
+            status="resolved",
+            updated_by="developer_ai",
+        )
+
+        # 已解决后，双方都不再需要回复
+        self.assertEqual(len(self.store.list_actionable_threads(author="developer_ai")), 0)
+        self.assertEqual(len(self.store.list_actionable_threads(author="reviewer_ai")), 0)
 
 
 if __name__ == "__main__":

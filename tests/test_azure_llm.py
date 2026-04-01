@@ -57,6 +57,31 @@ class TestAzureLLM(unittest.TestCase):
         body = json.loads(req.data.decode('utf-8'))
         self.assertNotIn("model", body)
         self.assertEqual(body["messages"], messages)
+        self.assertEqual(body["max_tokens"], 4000)  # default safety cap
+        self.assertNotIn("tools", body)  # empty tool_defs should not be sent
+
+    @patch('urllib.request.urlopen')
+    def test_tools_field_included_when_non_empty(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "ok"}}]
+        }).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        llm._call_llm(
+            [{"role": "user", "content": "hello"}],
+            [{
+                "type": "function",
+                "function": {
+                    "name": "dummy_tool",
+                    "description": "dummy",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+        )
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertIn("tools", body)
 
 if __name__ == '__main__':
     unittest.main()

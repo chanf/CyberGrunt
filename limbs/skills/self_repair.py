@@ -6,7 +6,9 @@ import os
 import json
 import logging
 import subprocess
+import shutil
 from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Tuple
 from limbs.hub import limb
 import limbs.hub as hub
 
@@ -15,6 +17,148 @@ CST = timezone(timedelta(hours=8))
 
 # Plugin directory: root plugins/
 _plugins_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "plugins")
+
+_CLEANUP_SUFFIXES = (".log", ".tmp", ".cache", ".old", ".db-wal", ".db-shm")
+_DEFAULT_DISK_THRESHOLD_MB = 1024
+_DEFAULT_CLEANUP_LIMIT_MB = 256
+
+
+def _project_root(ctx: Dict[str, Any]) -> str:
+    workspace = ctx.get("workspace", ".")
+    return os.path.abspath(os.path.dirname(workspace))
+
+
+def _safe_disk_usage(path: str) -> Tuple[int, int, int]:
+    usage = shutil.disk_usage(path)
+    return int(usage.total), int(usage.used), int(usage.free)
+
+
+def _collect_cleanup_candidates(ctx: Dict[str, Any]) -> List[Tuple[float, str, int]]:
+    """Collect low-risk cleanup candidates: logs/tmp/cache/wal files."""
+    workspace = ctx.get("workspace", ".")
+    root = _project_root(ctx)
+    scan_dirs = [
+        os.path.join(root, "test_reports"),
+        os.path.join(workspace, "tmp"),
+        os.path.join(workspace, "forum"),
+        os.path.join(root, "ai_forum", "ai_forum"),
+    ]
+
+    candidates: List[Tuple[float, str, int]] = []
+    for scan_dir in scan_dirs:
+        if not os.path.isdir(scan_dir):
+            continue
+        for base, _, files in os.walk(scan_dir):
+            for name in files:
+                if not name.endswith(_CLEANUP_SUFFIXES):
+                    continue
+                fpath = os.path.join(base, name)
+                try:
+                    stat = os.stat(fpath)
+                except OSError:
+                    continue
+                candidates.append((stat.st_mtime, fpath, int(stat.st_size)))
+
+    candidates.sort(key=lambda item: item[0])  # oldest first
+    return candidates
+
+
+def _cleanup_disk_if_needed(ctx: Dict[str, Any], threshold_mb: int, cleanup_limit_mb: int) -> Dict[str, Any]:
+    """Delete low-risk temp/log files when free disk is below threshold."""
+    workspace = ctx.get("workspace", ".")
+    _, _, free_before = _safe_disk_usage(workspace)
+    free_before_mb = free_before // (1024 * 1024)
+
+    result: Dict[str, Any] = {
+        "triggered": free_before_mb < threshold_mb,
+        "free_before_mb": free_before_mb,
+        "free_after_mb": free_before_mb,
+        "deleted_count": 0,
+        "reclaimed_mb": 0,
+        "deleted_files": [],
+        "errors": [],
+    }
+    if not result["triggered"]:
+        return result
+
+    budget_bytes = max(1, int(cleanup_limit_mb)) * 1024 * 1024
+    reclaimed = 0
+    deleted_files: List[str] = []
+    errors: List[str] = []
+    root = _project_root(ctx)
+    for _, fpath, fsize in _collect_cleanup_candidates(ctx):
+        if reclaimed >= budget_bytes:
+            break
+        try:
+            os.remove(fpath)
+            reclaimed += fsize
+            deleted_files.append(os.path.relpath(fpath, root))
+        except OSError as exc:
+            errors.append(f"{fpath}: {exc}")
+
+    _, _, free_after = _safe_disk_usage(workspace)
+    result["free_after_mb"] = free_after // (1024 * 1024)
+    result["deleted_count"] = len(deleted_files)
+    result["reclaimed_mb"] = reclaimed // (1024 * 1024)
+    result["deleted_files"] = deleted_files
+    result["errors"] = errors
+    return result
+
+
+def _get_offline_mcp_servers() -> List[str]:
+    """Best-effort offline check for stdio MCP servers."""
+    try:
+        import mcp_client
+    except Exception:
+        return []
+
+    offline: List[str] = []
+    for name, srv in mcp_client._servers.items():
+        transport = getattr(srv, "transport", "stdio")
+        if transport != "stdio":
+            continue
+        proc = getattr(srv, "_proc", None)
+        if proc is None or proc.poll() is not None:
+            offline.append(name)
+    return offline
+
+
+def _attempt_mcp_reconnect(force_reconnect: bool = False) -> Dict[str, Any]:
+    offline_before = _get_offline_mcp_servers()
+    should_attempt = force_reconnect or bool(offline_before)
+    if not should_attempt:
+        return {
+            "attempted": False,
+            "offline_before": offline_before,
+            "offline_after": offline_before,
+            "added": [],
+            "removed": [],
+            "total": len(offline_before),
+            "error": "",
+        }
+
+    try:
+        added, removed, total = hub.reload_mcp()
+        offline_after = _get_offline_mcp_servers()
+        return {
+            "attempted": True,
+            "offline_before": offline_before,
+            "offline_after": offline_after,
+            "added": sorted(list(added)),
+            "removed": sorted(list(removed)),
+            "total": int(total),
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "offline_before": offline_before,
+            "offline_after": _get_offline_mcp_servers(),
+            "added": [],
+            "removed": [],
+            "total": 0,
+            "error": str(exc),
+        }
 
 @limb("self_check", "System self-check: collect today's conversation stats, system health, "
       "error logs, scheduled task status, etc. Used to generate daily self-check reports.", {})
@@ -104,6 +248,109 @@ def tool_diagnose(args, ctx):
             report.append("  %s: %d tools, %s" % (name, len(srv._tools), alive))
             
     return "\n".join(report)
+
+
+@limb(
+    "self_repair_loop",
+    "Run one self-repair cycle: self_check + diagnose + targeted healing "
+    "(disk cleanup and MCP reconnect) + post-repair diagnose.",
+    {
+        "disk_free_mb_threshold": {
+            "type": "integer",
+            "description": "Trigger cleanup when free disk (MB) is below this threshold. Default 1024.",
+        },
+        "cleanup_limit_mb": {
+            "type": "integer",
+            "description": "Max MB to delete during one cleanup cycle. Default 256.",
+        },
+        "force_mcp_reconnect": {
+            "type": "boolean",
+            "description": "Force MCP reload even when offline status is not detected.",
+        },
+    },
+)
+def tool_self_repair_loop(args, ctx):
+    threshold_mb = int(args.get("disk_free_mb_threshold", _DEFAULT_DISK_THRESHOLD_MB))
+    cleanup_limit_mb = int(args.get("cleanup_limit_mb", _DEFAULT_CLEANUP_LIMIT_MB))
+    force_mcp_reconnect = bool(args.get("force_mcp_reconnect", False))
+
+    # Baseline diagnostics
+    pre_check = tool_self_check({}, ctx)
+    pre_diag = tool_diagnose({"target": "all"}, ctx)
+
+    # Repair actions
+    disk_result = _cleanup_disk_if_needed(ctx, threshold_mb, cleanup_limit_mb)
+    mcp_result = _attempt_mcp_reconnect(force_mcp_reconnect)
+
+    # Post diagnostics
+    post_diag = tool_diagnose({"target": "all"}, ctx)
+
+    lines = []
+    lines.append("== Self Repair Loop ==")
+    lines.append("Time: %s" % datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S CST"))
+    lines.append("")
+    lines.append("== Self Check (Before) ==")
+    lines.append(pre_check)
+    lines.append("")
+    lines.append("== Diagnose (Before) ==")
+    lines.append(pre_diag)
+    lines.append("")
+    lines.append("== Repair Actions ==")
+
+    if disk_result["triggered"]:
+        lines.append(
+            "Disk cleanup triggered: free %dMB -> %dMB, deleted %d files, reclaimed %dMB."
+            % (
+                disk_result["free_before_mb"],
+                disk_result["free_after_mb"],
+                disk_result["deleted_count"],
+                disk_result["reclaimed_mb"],
+            )
+        )
+        if disk_result["deleted_files"]:
+            lines.append("Deleted files:")
+            for rel in disk_result["deleted_files"][:20]:
+                lines.append("  - %s" % rel)
+            if len(disk_result["deleted_files"]) > 20:
+                lines.append("  - ... (%d more)" % (len(disk_result["deleted_files"]) - 20))
+        if disk_result["errors"]:
+            lines.append("Cleanup errors:")
+            for err in disk_result["errors"][:10]:
+                lines.append("  - %s" % err)
+    else:
+        lines.append(
+            "Disk cleanup skipped: free %dMB >= threshold %dMB."
+            % (disk_result["free_before_mb"], threshold_mb)
+        )
+
+    if mcp_result["attempted"]:
+        if mcp_result["error"]:
+            lines.append(
+                "MCP reconnect attempted but failed: %s. offline(before)=%s offline(after)=%s"
+                % (
+                    mcp_result["error"],
+                    ",".join(mcp_result["offline_before"]) or "none",
+                    ",".join(mcp_result["offline_after"]) or "none",
+                )
+            )
+        else:
+            lines.append(
+                "MCP reconnect attempted: offline(before)=%s offline(after)=%s added=%s removed=%s total=%d."
+                % (
+                    ",".join(mcp_result["offline_before"]) or "none",
+                    ",".join(mcp_result["offline_after"]) or "none",
+                    ",".join(mcp_result["added"]) or "none",
+                    ",".join(mcp_result["removed"]) or "none",
+                    mcp_result["total"],
+                )
+            )
+    else:
+        lines.append("MCP reconnect skipped: no offline stdio server detected.")
+
+    lines.append("")
+    lines.append("== Diagnose (After) ==")
+    lines.append(post_diag)
+    return "\n".join(lines)
 
 @limb("create_tool", "Create a new custom tool plugin. Code is hot-loaded immediately. Persists across restarts. Use @limb decorator in code to register tools.",
       {"name": {"type": "string", "description": "Tool name (e.g. 'weather')"},

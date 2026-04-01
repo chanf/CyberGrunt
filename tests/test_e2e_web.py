@@ -38,6 +38,13 @@ class TestWebE2E(unittest.TestCase):
                 cls.server_proc.wait(timeout=5)
             except:
                 pass
+            finally:
+                try:
+                    if cls.server_proc.stdout:
+                        cls.server_proc.stdout.close()
+                except Exception:
+                    pass
+                cls.server_proc = None
 
     def test_chinese_ime_support(self):
         """Verify that Enter does not send message while composing (IME)."""

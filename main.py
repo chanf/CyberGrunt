@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import uuid
+import traceback
 import threading
 import queue
 import urllib.parse
@@ -55,6 +56,55 @@ scheduler.init(os.path.join(BASE_DIR, "jobs.json"), llm.chat)
 limbs_hub.init_extra(CONF)
 mem_mod.init(CONF, CONF.get('models', {}), DIRS["memory"])
 
+SELF_REPAIR_JOB_NAME = "daily_self_repair_0200"
+SELF_REPAIR_CRON_EXPR = "0 2 * * *"
+SELF_REPAIR_MESSAGE = (
+    "【系统计划任务】执行每日自修复闭环。\n"
+    "步骤要求：\n"
+    "1) 调用 self_repair_loop 工具（建议参数 {\"disk_free_mb_threshold\": 1024, \"cleanup_limit_mb\": 256}）。\n"
+    "2) 将 self_repair_loop 的完整输出通过 message 工具发送给主人。\n"
+    "3) 返回一句执行结果摘要。"
+)
+
+
+def _ensure_daily_self_repair_schedule():
+    """Ensure fixed daily self-repair schedule at 02:00."""
+    try:
+        result = scheduler.add(
+            {
+                "name": SELF_REPAIR_JOB_NAME,
+                "message": SELF_REPAIR_MESSAGE,
+                "cron_expr": SELF_REPAIR_CRON_EXPR,
+                "once": False,
+            }
+        )
+        log.info("[boot] ensured daily self-repair schedule: %s", result)
+    except Exception as exc:
+        log.error("[boot] failed to ensure daily self-repair schedule: %s", exc, exc_info=True)
+
+
+_ensure_daily_self_repair_schedule()
+
+_RECENT_ERROR_LOCK = threading.Lock()
+_RECENT_ERROR = None
+
+
+def _record_recent_error(where, exc):
+    """Store latest stack trace for /api/test/health diagnostics."""
+    global _RECENT_ERROR
+    with _RECENT_ERROR_LOCK:
+        _RECENT_ERROR = {
+            "where": where,
+            "message": str(exc),
+            "stack": traceback.format_exc(limit=20),
+            "ts": datetime.now(CST).isoformat(timespec="seconds"),
+        }
+
+
+def _get_recent_error():
+    with _RECENT_ERROR_LOCK:
+        return dict(_RECENT_ERROR) if _RECENT_ERROR else None
+
 # ============================================================
 #  2. Event Bus (The Message Backbone)
 # ============================================================
@@ -75,8 +125,12 @@ class EventBus:
     def unsubscribe(cls, sid, q):
         with cls._lock:
             if sid in cls._clients:
-                try: cls._clients[sid].remove(q)
-                except ValueError: pass
+                try:
+                    cls._clients[sid].remove(q)
+                except ValueError:
+                    pass
+                if not cls._clients[sid]:
+                    del cls._clients[sid]
 
     @classmethod
     def publish(cls, sid, event_type, content, extra=None):
@@ -89,9 +143,39 @@ class EventBus:
                 for q in cls._clients[sid]:
                     q.put(raw_data)
 
+    @classmethod
+    def stats(cls):
+        with cls._lock:
+            active_sessions = sum(1 for _, queues in cls._clients.items() if queues)
+            active_connections = sum(len(queues) for queues in cls._clients.values())
+        return {
+            "active_sessions": active_sessions,
+            "active_connections": active_connections,
+        }
+
 # ============================================================
 #  3. Async Task Processor
 # ============================================================
+
+
+def _loaded_limb_names():
+    try:
+        return sorted(name for name, _ in limbs_hub.Registry.items())
+    except Exception:
+        return []
+
+
+def _build_test_health_payload():
+    stats = EventBus.stats()
+    return {
+        "ok": True,
+        "active_sessions": stats["active_sessions"],
+        "active_connections": stats["active_connections"],
+        "loaded_limbs": _loaded_limb_names(),
+        "recent_error": _get_recent_error(),
+        "ts": datetime.now(CST).isoformat(timespec="seconds"),
+    }
+
 
 def run_agent_task(sid, text):
     """The background worker that executes the agent loop."""
@@ -104,6 +188,7 @@ def run_agent_task(sid, text):
         EventBus.publish(sid, "reply", reply)
     except Exception as e:
         log.error(f"[Task] Error for {sid}: {e}", exc_info=True)
+        _record_recent_error("run_agent_task", e)
         EventBus.publish(sid, "error", str(e))
     finally:
         EventBus.publish(sid, "done", "Task finished")
@@ -131,6 +216,8 @@ class AgentRouter(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/events":
             self.handle_events(parsed)
+        elif parsed.path == "/api/test/health":
+            self.handle_test_health()
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -141,21 +228,24 @@ class AgentRouter(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get('Content-Length', 0))
             data = json.loads(self.rfile.read(length).decode('utf-8'))
-        except: self.send_response(400); self.end_headers(); return
+        except Exception as e:
+            _record_recent_error("http_post_parse", e)
+            self._send_json(400, {"error": "invalid json body"})
+            return
 
         if self.path == "/chat":
             sid = data.get("sid", "default")
             text = data.get("text", "").strip()
             # 1. Immediately acknowledge the request
-            self.send_response(202) # Accepted
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "accepted"}).encode("utf-8"))
+            self._send_json(202, {"status": "accepted"})
             
             # 2. Fire up the background engine
             threading.Thread(target=run_agent_task, args=(sid, text), daemon=True).start()
         else:
-            self.send_response(404); self.end_headers()
+            self._send_json(404, {"error": "not found"})
+
+    def handle_test_health(self):
+        self._send_json(200, _build_test_health_payload())
 
     def handle_events(self, parsed):
         """Standard SSE endpoint using the EventBus subscription."""
@@ -185,6 +275,14 @@ class AgentRouter(BaseHTTPRequestHandler):
         finally:
             EventBus.unsubscribe(sid, q)
 
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -213,6 +311,10 @@ HTML_UI = r"""
         #log-header { padding: 15px; color: white; font-weight: bold; border-bottom: 1px solid #333; font-size: 13px; }
         #log-view { flex: 1; overflow-y: auto; padding: 15px; font-family: 'SF Mono', monospace; font-size: 11px; line-height: 1.4; }
         .log-item { margin-bottom: 6px; border-left: 2px solid #444; padding-left: 10px; word-break: break-all; }
+        .log-event-tool-call { border-left-color: #3b82f6; }
+        .log-event-tool-success { border-left-color: #22c55e; }
+        .log-event-llm-timeout { border-left-color: #f59e0b; }
+        .log-event-error { border-left-color: #ef4444; }
         
         #main { flex: 1; display: flex; flex-direction: column; background: white; position: relative; }
         #chat { flex: 1; overflow-y: auto; padding: 30px; display: flex; flex-direction: column; gap: 20px; }
@@ -238,16 +340,16 @@ HTML_UI = r"""
     </style>
 </head>
 <body>
-    <div id="sidebar">
+    <div id="sidebar" data-testid="log-panel">
         <div id="log-header">LIVE AGENT LOGS</div>
-        <div id="log-view"></div>
+        <div id="log-view" data-testid="log-stream"></div>
     </div>
     <div id="main">
-        <div id="chat"></div>
-        <div id="system-status"></div>
-        <div id="input-area">
-            <input type="text" id="userInput" placeholder="Send a command..." autocomplete="off">
-            <button id="sendBtn">Send</button>
+        <div id="chat" data-testid="chat-stream"></div>
+        <div id="system-status" data-testid="system-status-bar"></div>
+        <div id="input-area" data-testid="input-area">
+            <input type="text" id="userInput" data-testid="chat-input" placeholder="Send a command..." autocomplete="off">
+            <button id="sendBtn" data-testid="send-button">Send</button>
         </div>
     </div>
 
@@ -295,16 +397,36 @@ HTML_UI = r"""
         connectEvents();
 
         function appendLog(txt) {
+            const marker = classifyLogEvent(txt);
             const el = document.createElement('div');
-            el.className = 'log-item';
+            el.className = `log-item ${marker.className}`;
+            el.setAttribute('data-testid', marker.testId);
             el.textContent = `[${new Date().toLocaleTimeString()}] ${txt}`;
             ui.logs.appendChild(el);
             ui.logs.scrollTop = ui.logs.scrollHeight;
         }
 
+        function classifyLogEvent(txt) {
+            const raw = String(txt || '');
+            if (raw.startsWith('Action:')) {
+                return {className: 'log-event-tool-call', testId: 'log-event-tool-call'};
+            }
+            if (raw.startsWith('Result:')) {
+                return {className: 'log-event-tool-success', testId: 'log-event-tool-success'};
+            }
+            if (/timeout|timed out/i.test(raw)) {
+                return {className: 'log-event-llm-timeout', testId: 'log-event-llm-timeout'};
+            }
+            if (raw.startsWith('Error:') || raw.toLowerCase().includes('error')) {
+                return {className: 'log-event-error', testId: 'log-event-error'};
+            }
+            return {className: 'log-event-generic', testId: 'log-event-generic'};
+        }
+
         function addBubble(role, content) {
             const el = document.createElement('div');
             el.className = `bubble ${role}`;
+            el.setAttribute('data-testid', role === 'user' ? 'chat-bubble-user' : 'chat-bubble-bot');
             if (role === 'bot') el.innerHTML = marked.parse(content);
             else el.textContent = content;
             ui.chat.appendChild(el);

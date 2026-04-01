@@ -78,8 +78,15 @@ def _call_llm(messages, tool_defs):
     if tool_defs:
         body["tools"] = tool_defs
         
-    if provider.get("max_tokens"):
-        body["max_tokens"] = provider["max_tokens"]
+    # Default/cap max_tokens to improve compatibility across Azure deployments.
+    configured_max_tokens = provider.get("max_tokens", 4000)
+    try:
+        configured_max_tokens = int(configured_max_tokens)
+    except (TypeError, ValueError):
+        configured_max_tokens = 4000
+    if configured_max_tokens <= 0:
+        configured_max_tokens = 4000
+    body["max_tokens"] = min(configured_max_tokens, 4000)
         
     # Standard OpenAI requires 'model', but Azure embeds it in the URL
     if provider.get("type") != "azure":

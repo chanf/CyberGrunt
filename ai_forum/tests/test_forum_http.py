@@ -7,17 +7,8 @@ import time
 import unittest
 import urllib.request
 
-from ai_forum.forum_runtime import ForumRuntime
-from ai_forum.forum_server import create_server
+from ai_forum.forum_server import create_app, create_server
 from ai_forum.forum_store import ForumStore
-
-
-class _DummyLLM:
-    def generate_post(self, open_thread_count):
-        return {"title": "dummy", "body": "dummy"}
-
-    def generate_reply(self, thread):
-        return "dummy"
 
 
 class TestForumHTTP(unittest.TestCase):
@@ -25,21 +16,8 @@ class TestForumHTTP(unittest.TestCase):
     def setUpClass(cls):
         cls.tmpdir = tempfile.mkdtemp()
         cls.store = ForumStore(os.path.join(cls.tmpdir, "forum.db"))
-        cls.runtime = ForumRuntime(
-            store=cls.store,
-            llm_client=_DummyLLM(),
-            settings={
-                "poster_interval_sec": 120,
-                "review_interval_sec": 30,
-                "max_open_threads": 20,
-            },
-        )
-
-        cls.t1 = cls.store.create_thread("帖子A", "内容A")
-        cls.store.create_reply(thread_id=cls.t1["id"], body="回帖A", author="reviewer_ai")
-        cls.t2 = cls.store.create_thread("帖子B", "内容B")
-
-        cls.server = create_server(cls.runtime, host="127.0.0.1", port=0)
+        cls.app = create_app(cls.store)
+        cls.server = create_server(cls.app, host="127.0.0.1", port=0)
         cls.port = cls.server.server_address[1]
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -49,25 +27,71 @@ class TestForumHTTP(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
-        cls.runtime.stop_workers()
         cls.store.close()
         shutil.rmtree(cls.tmpdir)
 
     def _url(self, path):
         return f"http://127.0.0.1:{self.port}{path}"
 
-    def test_list_threads_endpoint(self):
-        with urllib.request.urlopen(self._url("/api/threads?status=all&limit=10"), timeout=3) as resp:
-            payload = json.loads(resp.read())
-        self.assertIn("threads", payload)
-        self.assertGreaterEqual(len(payload["threads"]), 2)
+    def _post_json(self, path, payload):
+        req = urllib.request.Request(
+            self._url(path),
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
 
-    def test_single_thread_endpoint(self):
-        with urllib.request.urlopen(self._url(f"/api/threads/{self.t1['id']}"), timeout=3) as resp:
+    def test_thread_reply_status_flow(self):
+        created = self._post_json(
+            "/api/threads",
+            {
+                "author": "developer_ai",
+                "title": "实现论坛 API",
+                "body": "我会先做发帖回帖接口。",
+                "status": "pending",
+            },
+        )
+        thread_id = created["thread"]["id"]
+        self.assertEqual(created["thread"]["status"], "pending")
+
+        replied = self._post_json(
+            f"/api/threads/{thread_id}/replies",
+            {
+                "author": "reviewer_ai",
+                "body": "请补一个 actionble 规则测试。",
+            },
+        )
+        self.assertEqual(replied["reply"]["thread_id"], thread_id)
+        self.assertEqual(replied["thread"]["last_actor"], "reviewer_ai")
+
+        updated = self._post_json(
+            f"/api/threads/{thread_id}/status",
+            {
+                "author": "developer_ai",
+                "status": "resolved",
+                "note": "已补测试并通过。",
+            },
+        )
+        self.assertEqual(updated["thread"]["status"], "resolved")
+        self.assertEqual(updated["thread"]["updated_by"], "developer_ai")
+
+    def test_actionable_endpoint(self):
+        created = self._post_json(
+            "/api/threads",
+            {
+                "author": "reviewer_ai",
+                "title": "测试报告: 回帖策略",
+                "body": "当前发现 developer_ai 在 pending 帖回复不及时。",
+            },
+        )
+        thread_id = created["thread"]["id"]
+
+        with urllib.request.urlopen(self._url("/api/actionable?author=developer_ai&limit=20"), timeout=3) as resp:
             payload = json.loads(resp.read())
-        self.assertIn("thread", payload)
-        self.assertEqual(payload["thread"]["id"], self.t1["id"])
-        self.assertEqual(len(payload["thread"]["replies"]), 1)
+        ids = [t["id"] for t in payload["threads"]]
+        self.assertIn(thread_id, ids)
 
     def test_sse_event_format(self):
         with urllib.request.urlopen(self._url("/api/events"), timeout=3) as stream:
@@ -76,11 +100,11 @@ class TestForumHTTP(unittest.TestCase):
             self.assertEqual(line1, "event: connected")
             self.assertTrue(line2.startswith("data: "))
 
-            self.runtime.event_bus.publish("thread_created", {"thread": {"id": 999, "title": "x"}})
+            self.app.bus.publish("thread_created", {"thread": {"id": 888, "title": "x"}})
 
             event_line = ""
             data_line = ""
-            for _ in range(8):
+            for _ in range(10):
                 raw = stream.readline().decode("utf-8").strip()
                 if not raw:
                     continue
