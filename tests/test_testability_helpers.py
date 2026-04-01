@@ -76,6 +76,7 @@ class TestTestabilityHelpers(unittest.TestCase):
             "log-event-tool-call",
             "log-event-tool-success",
             "log-event-llm-timeout",
+            "log-event-tool-quality",
             "log-event-error",
         ]
         for marker in markers:

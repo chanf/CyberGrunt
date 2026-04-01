@@ -15,6 +15,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 
 from limbs import hub as limbs_hub
+from brain import tool_quality as tool_quality_mod
 
 log = logging.getLogger("agent")
 CST = timezone(timedelta(hours=8))
@@ -36,6 +37,7 @@ def init(models_config, workspace, owner_id, sessions_dir):
     _workspace = workspace
     _owner_id = owner_id
     _sessions_dir = sessions_dir
+    tool_quality_mod.init(workspace)
 
 
 # ============================================================
@@ -428,17 +430,58 @@ def _chat_inner(user_msg, session_key, images=None, on_log=None):
             try:
                 args_str = tc["function"]["arguments"]
                 func_args = json.loads(args_str)
+                if not isinstance(func_args, dict):
+                    func_args = {}
                 log_step(f"Action: Calling tool '{t_name}' with args {args_str[:100]}...")
             except:
                 func_args = {}
                 log_step(f"Action: Calling tool '{t_name}'...")
 
-            try:
-                result = limbs_hub.execute(t_name, func_args, ctx)
-                log_step(f"Result: {str(result)[:100]}...")
-            except Exception as e:
-                result = f"[error] tool execution failed: {e}"
-                log_step(f"Error: {e}")
+            confirm_experimental = bool(func_args.pop("confirm_experimental", False))
+            tool_status = tool_quality_mod.get_tool_status(t_name)
+
+            if tool_status.get("experimental") and not confirm_experimental:
+                result = (
+                    f"[error] tool '{t_name}' is experimental "
+                    f"(calls={tool_status.get('calls', 0)}, "
+                    f"success_rate={tool_status.get('success_rate', 0.0):.2f}). "
+                    "Set confirm_experimental=true to continue."
+                )
+                log_step(
+                    f"[tool_quality] blocked experimental tool '{t_name}' "
+                    f"(success_rate={tool_status.get('success_rate', 0.0):.2f})"
+                )
+                tool_quality_mod.record_call(
+                    tool_name=t_name,
+                    ok=False,
+                    blocked=True,
+                    error="experimental confirmation required",
+                )
+            else:
+                if tool_status.get("experimental") and confirm_experimental:
+                    log_step(
+                        f"[tool_quality] confirmed experimental tool '{t_name}' "
+                        "(confirm_experimental=true)"
+                    )
+                try:
+                    result = limbs_hub.execute(t_name, func_args, ctx)
+                    log_step(f"Result: {str(result)[:100]}...")
+                    is_ok = not (isinstance(result, str) and result.lstrip().startswith("[error]"))
+                    tool_quality_mod.record_call(
+                        tool_name=t_name,
+                        ok=is_ok,
+                        blocked=False,
+                        error=str(result)[:500] if not is_ok else "",
+                    )
+                except Exception as e:
+                    result = f"[error] tool execution failed: {e}"
+                    log_step(f"Error: {e}")
+                    tool_quality_mod.record_call(
+                        tool_name=t_name,
+                        ok=False,
+                        blocked=False,
+                        error=str(e),
+                    )
             
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
 

@@ -314,6 +314,7 @@ HTML_UI = r"""
         .log-event-tool-call { border-left-color: #3b82f6; }
         .log-event-tool-success { border-left-color: #22c55e; }
         .log-event-llm-timeout { border-left-color: #f59e0b; }
+        .log-event-tool-quality { border-left-color: #14b8a6; }
         .log-event-error { border-left-color: #ef4444; }
         
         #main { flex: 1; display: flex; flex-direction: column; background: white; position: relative; }
@@ -408,6 +409,9 @@ HTML_UI = r"""
 
         function classifyLogEvent(txt) {
             const raw = String(txt || '');
+            if (raw.includes('[tool_quality]')) {
+                return {className: 'log-event-tool-quality', testId: 'log-event-tool-quality'};
+            }
             if (raw.startsWith('Action:')) {
                 return {className: 'log-event-tool-call', testId: 'log-event-tool-call'};
             }
