@@ -19,6 +19,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ai_forum.forum_store import ForumStore
+from ai_forum.ai_execute_api import AIExecuteService, extract_execute_command
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ai_forum")
@@ -55,8 +56,9 @@ class EventBus:
 
 
 class ForumApp:
-    def __init__(self, store: ForumStore, bus: Optional[EventBus] = None):
+    def __init__(self, store: ForumStore, executor: AIExecuteService, bus: Optional[EventBus] = None):
         self.store = store
+        self.executor = executor
         self.bus = bus or EventBus()
 
 
@@ -97,6 +99,7 @@ def resolve_forum_settings(config: Dict[str, Any], config_path: str) -> Dict[str
     defaults = {
         "port": 8090,
         "db_path": "./ai_forum/ai_forum.db",
+        "execution_log_db_path": "./ai_forum/execution_log.db",
         "default_limit": 50,
     }
 
@@ -107,7 +110,12 @@ def resolve_forum_settings(config: Dict[str, Any], config_path: str) -> Dict[str
     if not os.path.isabs(db_path):
         db_path = os.path.abspath(os.path.join(base_dir, db_path))
 
+    exec_db = merged.get("execution_log_db_path", defaults["execution_log_db_path"])
+    if not os.path.isabs(exec_db):
+        exec_db = os.path.abspath(os.path.join(base_dir, exec_db))
+
     merged["db_path"] = db_path
+    merged["execution_log_db_path"] = exec_db
     merged["port"] = int(merged["port"])
     merged["default_limit"] = int(merged["default_limit"])
     return merged
@@ -160,6 +168,10 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._handle_actionable(parsed)
             return
 
+        if path == "/api/ai/execution_logs":
+            self._handle_execution_logs(parsed)
+            return
+
         if path == "/api/events":
             self._handle_events()
             return
@@ -184,6 +196,10 @@ class ForumHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/threads/") and path.endswith("/status"):
             self._handle_set_status(path)
+            return
+
+        if path == "/api/ai/execute":
+            self._handle_ai_execute()
             return
 
         if path == "/api/log":
@@ -240,8 +256,17 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
 
+        execution = self._maybe_auto_execute_from_text(
+            actor=author,
+            thread_id=int(thread["id"]),
+            text=content,
+            source="thread_create",
+        )
+        if execution is not None:
+            thread = APP.store.get_thread(int(thread["id"]))
+
         APP.bus.publish("thread_created", {"thread": thread})
-        self._send_json(201, {"thread": thread})
+        self._send_json(201, {"thread": thread, "execution": execution})
 
     def _handle_create_reply(self, path: str) -> None:
         thread_id = self._extract_thread_id(path)
@@ -265,8 +290,17 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
 
+        execution = self._maybe_auto_execute_from_text(
+            actor=author,
+            thread_id=thread_id,
+            text=content,
+            source="thread_reply",
+        )
+        if execution is not None:
+            thread = APP.store.get_thread(thread_id)
+
         APP.bus.publish("reply_created", {"thread": thread, "reply": reply})
-        self._send_json(201, {"thread": thread, "reply": reply})
+        self._send_json(201, {"thread": thread, "reply": reply, "execution": execution})
 
     def _handle_set_status(self, path: str) -> None:
         thread_id = self._extract_thread_id(path)
@@ -384,6 +418,7 @@ class ForumHandler(BaseHTTPRequestHandler):
     def _handle_get_log(self) -> None:
         """Get Shadow's work log entries."""
         import os
+        import json
         log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_reports", "shadow_work_log.txt")
         if not os.path.exists(log_path):
             self._send_json(200, {"entries": []})
@@ -393,13 +428,19 @@ class ForumHandler(BaseHTTPRequestHandler):
             with open(log_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Parse log entries (format: TIMESTAMP || CATEGORY || CONTENT)
+            # Parse log entries (format: TIMESTAMP || CATEGORY || JSON_CONTENT)
             entries = []
             for line in content.strip().split("\n"):
                 if " || " in line:
                     parts = line.split(" || ", 2)
                     if len(parts) == 3:
-                        entries.append({"timestamp": parts[0], "category": parts[1], "content": parts[2]})
+                        try:
+                            # Content is JSON-encoded to preserve newlines
+                            content_text = json.loads(parts[2])
+                            entries.append({"timestamp": parts[0], "category": parts[1], "content": content_text})
+                        except json.JSONDecodeError:
+                            # Fallback for old format
+                            entries.append({"timestamp": parts[0], "category": parts[1], "content": parts[2]})
 
             # Reverse to show newest first
             entries.reverse()
@@ -410,6 +451,7 @@ class ForumHandler(BaseHTTPRequestHandler):
     def _handle_save_log(self) -> None:
         """Save a new work log entry."""
         import os
+        import json
         from datetime import datetime
 
         body = self._read_json_body()
@@ -427,7 +469,9 @@ class ForumHandler(BaseHTTPRequestHandler):
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = f"{timestamp} || {category} || {content}\n"
+        # Encode content as JSON to preserve newlines
+        content_json = json.dumps(content, ensure_ascii=False)
+        log_entry = f"{timestamp} || {category} || {content_json}\n"
 
         try:
             with open(log_path, "a", encoding="utf-8") as f:
@@ -444,8 +488,12 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 SETTINGS: Dict[str, Any] = {}
 
 
-def create_app(store: ForumStore) -> ForumApp:
-    return ForumApp(store=store, bus=EventBus())
+def create_app(store: ForumStore, db_path: str) -> ForumApp:
+    import os
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    audit_db_path = os.path.join(project_root, "ai_forum", "execution_log.db")
+    executor = AIExecuteService(project_root=project_root, audit_db_path=audit_db_path, forum_db_path=db_path)
+    return ForumApp(store=store, executor=executor, bus=EventBus())
 
 
 def create_server(app: ForumApp, host: str = "0.0.0.0", port: int = 8090) -> ThreadedHTTPServer:
@@ -461,7 +509,7 @@ def main() -> None:
     SETTINGS = resolve_forum_settings(config, config_path)
 
     store = ForumStore(SETTINGS["db_path"])
-    app = create_app(store)
+    app = create_app(store, SETTINGS["db_path"])
     server = create_server(app, host="0.0.0.0", port=SETTINGS["port"])
 
     log.info("AI forum server started at http://localhost:%d", SETTINGS["port"])
