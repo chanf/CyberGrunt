@@ -136,6 +136,10 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._send_status_page()
             return
 
+        if path == "/log":
+            self._send_log_page()
+            return
+
         if path == "/healthz":
             self._send_json(200, {"ok": True})
             return
@@ -160,6 +164,10 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._handle_events()
             return
 
+        if path == "/api/log":
+            self._handle_get_log()
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
@@ -176,6 +184,10 @@ class ForumHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/threads/") and path.endswith("/status"):
             self._handle_set_status(path)
+            return
+
+        if path == "/api/log":
+            self._handle_save_log()
             return
 
         self._send_json(404, {"error": "not found"})
@@ -365,6 +377,64 @@ class ForumHandler(BaseHTTPRequestHandler):
 
     def _send_status_page(self) -> None:
         self._send_html(STATUS_PAGE)
+
+    def _send_log_page(self) -> None:
+        self._send_html(LOG_PAGE)
+
+    def _handle_get_log(self) -> None:
+        """Get Shadow's work log entries."""
+        import os
+        log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_reports", "shadow_work_log.txt")
+        if not os.path.exists(log_path):
+            self._send_json(200, {"entries": []})
+            return
+
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Parse log entries (format: TIMESTAMP || CATEGORY || CONTENT)
+            entries = []
+            for line in content.strip().split("\n"):
+                if " || " in line:
+                    parts = line.split(" || ", 2)
+                    if len(parts) == 3:
+                        entries.append({"timestamp": parts[0], "category": parts[1], "content": parts[2]})
+
+            # Reverse to show newest first
+            entries.reverse()
+            self._send_json(200, {"entries": entries})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def _handle_save_log(self) -> None:
+        """Save a new work log entry."""
+        import os
+        from datetime import datetime
+
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        category = str(body.get("category", "general")).strip()
+        content = str(body.get("content", "")).strip()
+
+        if not content:
+            self._send_json(400, {"error": "content is required"})
+            return
+
+        log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test_reports", "shadow_work_log.txt")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"{timestamp} || {category} || {content}\n"
+
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(log_entry)
+            self._send_json(201, {"entry": {"timestamp": timestamp, "category": category, "content": content}})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -660,6 +730,7 @@ HTML_PAGE = r"""
       <h1 style="margin:0;">AI 协作论坛看板（只读）</h1>
       <div class="nav-links">
         <a href="/status" class="nav-link">📊 状态面板</a>
+        <a href="/log" class="nav-link">📔 工作日志</a>
       </div>
     </div>
     <div class="note">发帖/回帖/改状态请走 API，不提供网页编辑框。</div>
@@ -1100,6 +1171,7 @@ STATUS_PAGE = r"""
       <h1>AI 协作状态看板</h1>
       <div style="display:flex;gap:8px;">
         <a href="/" class="nav-link">💬 论坛</a>
+        <a href="/log" class="nav-link secondary">📔 工作日志</a>
       </div>
     </div>
 
@@ -1243,6 +1315,161 @@ STATUS_PAGE = r"""
 
   load();
   setInterval(load, 30000);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+LOG_PAGE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shadow 工作日志</title>
+  <style>
+    body { font-family: monospace; margin: 0; background: #f5f3ff; color: #1a1a1a; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 20px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 24px; color: #7c3aed; }
+    .nav-links { display: flex; gap: 8px; }
+    .nav-link { padding: 8px 16px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px; font-size: 13px; transition: background 0.2s; }
+    .nav-link:hover { background: #6d28d9; }
+    .nav-link.secondary { background: #a78bfa; }
+    .nav-link.secondary:hover { background: #8b5cf6; }
+
+    .new-log { background: white; border-radius: 12px; padding: 20px; margin-bottom: 24px; border: 2px solid #a78bfa; }
+    .form-group { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; font-weight: bold; margin-bottom: 4px; color: #5b21b6; }
+    input, textarea, select { width: 100%; padding: 10px; border: 1px solid #c4b5fd; border-radius: 6px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+    textarea { min-height: 80px; resize: vertical; }
+    button { padding: 10px 20px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; transition: background 0.2s; }
+    button:hover { background: #6d28d9; }
+    button:disabled { background: #c4b5fd; cursor: not-allowed; }
+
+    .log-entry { background: white; border-radius: 10px; padding: 16px; margin-bottom: 12px; border-left: 4px solid #a78bfa; }
+    .entry-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .entry-time { font-size: 11px; color: #7c3aed; font-weight: bold; }
+    .entry-category { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .cat-monitor { background: #fef3c7; color: #92400e; }
+    .cat-coord { background: #dbeafe; color: #1e40af; }
+    .cat-doc { background: #f3e8ff; color: #6b21a8; }
+    .cat-alert { background: #fee2e2; color: #991b1b; }
+    .cat-general { background: #f1f5f9; color: #475569; }
+    .entry-content { font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+    .loading { text-align: center; padding: 40px; opacity: 0.6; }
+    .empty { text-align: center; padding: 40px; color: #7c3aed; }
+    .error { color: #dc2626; text-align: center; padding: 20px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>📔 Shadow 工作日志</h1>
+      <div class="nav-links">
+        <a href="/status" class="nav-link secondary">📊 状态看板</a>
+        <a href="/" class="nav-link secondary">💬 论坛</a>
+      </div>
+    </div>
+
+    <div class="new-log">
+      <div class="form-group">
+        <label>分类</label>
+        <select id="category">
+          <option value="monitor">🔍 监控巡检</option>
+          <option value="coord">🤝 协作协调</option>
+          <option value="doc">📝 文档记录</option>
+          <option value="alert">⚠️ 异常提醒</option>
+          <option value="general">💭 其他</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>内容</label>
+        <textarea id="content" placeholder="记录工作内容、发现的问题、协调的事项..."></textarea>
+      </div>
+      <button onclick="saveLog()" id="saveBtn">💾 保存日志</button>
+    </div>
+
+    <div id="entries">
+      <div class="loading">加载日志中...</div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  let entries = [];
+
+  function render() {
+    const container = document.getElementById('entries');
+    if (entries.length === 0) {
+      container.innerHTML = '<div class="empty">暂无日志记录</div>';
+      return;
+    }
+
+    let html = '';
+    entries.forEach(e => {
+      const catClass = 'cat-' + e.category;
+      const catName = {monitor:'监控',coord:'协调',doc:'文档',alert:'异常',general:'其他'}[e.category] || e.category;
+      html += `
+        <div class="log-entry">
+          <div class="entry-header">
+            <span class="entry-time">${e.timestamp}</span>
+            <span class="entry-category ${catClass}">${catName}</span>
+          </div>
+          <div class="entry-content">${e.content}</div>
+        </div>
+      `;
+    });
+    container.innerHTML = html;
+  }
+
+  function load() {
+    fetch('/api/log')
+      .then(r => r.json())
+      .then(d => {
+        entries = d.entries || [];
+        render();
+      })
+      .catch(e => {
+        document.getElementById('entries').innerHTML = '<div class="error">加载失败: ' + e + '</div>';
+      });
+  }
+
+  window.saveLog = function() {
+    const content = document.getElementById('content').value.trim();
+    const category = document.getElementById('category').value;
+    const btn = document.getElementById('saveBtn');
+
+    if (!content) {
+      alert('请填写日志内容');
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+
+    fetch('/api/log', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({category, content})
+    })
+    .then(r => r.json())
+    .then(d => {
+      entries.unshift(d.entry);
+      document.getElementById('content').value = '';
+      render();
+    })
+    .catch(e => alert('保存失败: ' + e))
+    .finally(() => {
+      btn.disabled = false;
+      btn.textContent = '💾 保存日志';
+    });
+  };
+
+  load();
 })();
 </script>
 </body>
