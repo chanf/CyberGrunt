@@ -171,7 +171,8 @@ python3 xiaowang.py
 
 完整配置结构请参考 `config.example.json`。关键部分包括：
 
-- **models** -- LLM 供应商（支持任何兼容 OpenAI 的 API）
+- **models** -- LLM 供应商。支持标准 OpenAI API 及 **Azure OpenAI Service**。
+    - 对于 Azure，需设置 `type: "azure"`, `deployment_name` 及 `api_version`。
 - **messaging** -- 消息平台凭据
 - **memory** -- 三层记忆系统设置
 - **asr** -- 语音转文本 API 凭据

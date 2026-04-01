@@ -49,21 +49,39 @@ def _get_provider():
 
 def _call_llm(messages, tool_defs):
     provider = _get_provider()
-    url = provider["api_base"].rstrip("/") + "/chat/completions"
+    
+    # 1. Determine URL and Headers based on provider type
+    if provider.get("type") == "azure":
+        # Azure format: {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}
+        endpoint = provider["api_base"].rstrip("/")
+        deployment = provider["deployment_name"]
+        version = provider.get("api_version", "2024-05-01-preview")
+        url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": provider["api_key"],
+        }
+    else:
+        # Standard OpenAI format
+        url = provider["api_base"].rstrip("/") + "/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {provider['api_key']}",
+        }
 
+    # 2. Build request body
     body = {
-        "model": provider["model"],
         "messages": messages,
         "tools": tool_defs,
         "max_tokens": provider.get("max_tokens", 8192),
     }
+    # Standard OpenAI requires 'model', but Azure embeds it in the URL
+    if provider.get("type") != "azure":
+        body["model"] = provider["model"]
+        
     extra = provider.get("extra_body", {})
     body.update(extra)
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {provider['api_key']}",
-    }
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers)

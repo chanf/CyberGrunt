@@ -260,7 +260,12 @@ HTML_UI = r"""
             status: document.getElementById('system-status')
         };
         const SID = Math.random().toString(36).substring(7);
-        marked.setOptions({ breaks: true, gfm: true });
+        let isComposing = false; // Track Chinese IME state
+
+        ui.input.addEventListener('compositionstart', () => { isComposing = true; });
+        ui.input.addEventListener('compositionend', () => { isComposing = false; });
+
+        function appendMessage(role, text) {
 
         // --- Persistent Event Connection ---
         function connectEvents() {
@@ -333,7 +338,9 @@ HTML_UI = r"""
         }
 
         ui.btn.onclick = sendCommand;
-        ui.input.onkeydown = (e) => { if(e.key === 'Enter') sendCommand(); };
+        ui.input.onkeydown = (e) => { 
+            if(e.key === 'Enter' && !isComposing) sendCommand(); 
+        };
     </script>
 </body>
 </html>
