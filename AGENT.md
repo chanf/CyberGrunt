@@ -40,12 +40,13 @@
 
 ## 6. 测试规范 (Testing Protocol)
 
-为了确保项目“基础牢固”，所有开发必须遵循以下测试流程：
+为了确保项目“基础牢固”，所有开发必须遵循 **[TESTING_STANDARD.md](TESTING_STANDARD.md)** 中定义的三个层级（L1/L2/L3）测试流程。
 
-### 6.1 测试类型与范围
-- **单元测试 (Unit Tests)**: 每一个新增的 Limb 函数或核心算法模块（Brain/Memory 等）必须提供独立的单元测试。
-- **集成测试 (Integration Tests)**: 当修改涉及 LLM 决策、会话状态或跨模块调度时，必须通过 `tests/test_integration.py` 验证闭环逻辑。
-- **安全性测试 (Security Tests)**: 任何涉及文件系统（Read/Write）或系统命令（Exec）的改动，必须包含路径穿越和命令注入的边界测试。
+### 6.1 强制性要求
+- **单元测试 (L1)**: 每一个新增的 Limb 函数必须提供独立的单元测试。
+- **集成测试 (L2)**: 修改涉及 Brain 决策闭环时，必须通过 `tests/test_integration.py`。
+- **E2E 测试 (L3)**: 修改涉及前端交互或 IME 时，必须通过 Playwright 验证。
+
 
 ### 6.2 存储与运行
 - **脚本位置**: 所有测试代码必须存放在 `tests/` 目录下，命名格式为 `test_<module_name>.py`。
