@@ -37,9 +37,10 @@ class TestToolQuality(unittest.TestCase):
         self.assertAlmostEqual(status["success_rate"], 0.5)
         self.assertTrue(status["experimental"])
 
-        tq.record_call("flaky_tool", ok=True, blocked=False)
+        for _ in range(5):
+            tq.record_call("flaky_tool", ok=True, blocked=False)
         status = tq.get_tool_status("flaky_tool")
-        self.assertAlmostEqual(status["success_rate"], 6 / 11, places=3)
+        self.assertAlmostEqual(status["success_rate"], 10 / 15, places=3)
         self.assertFalse(status["experimental"])
 
     def test_list_tools_contains_report_data(self):

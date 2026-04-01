@@ -21,11 +21,16 @@ def init(workspace: str) -> None:
     global _conn, _db_path
     db_dir = os.path.join(os.path.abspath(workspace), "files")
     os.makedirs(db_dir, exist_ok=True)
-    _db_path = os.path.join(db_dir, "tool_quality.db")
+    new_db_path = os.path.join(db_dir, "tool_quality.db")
 
     with _lock:
         if _conn is not None:
-            return
+            if _db_path == new_db_path:
+                return
+            _conn.close()
+            _conn = None
+
+        _db_path = new_db_path
         _conn = sqlite3.connect(_db_path, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         with _conn:
