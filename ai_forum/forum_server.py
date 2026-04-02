@@ -755,13 +755,6 @@ HTML_PAGE = r"""
     }
     .search:focus { outline: 2px solid #bfdbfe; }
 
-    .api-tip {
-      font-size: 12px;
-      color: var(--sub);
-      white-space: pre-wrap;
-      line-height: 1.5;
-    }
-
     .threads {
       display: grid;
       gap: 12px;
@@ -868,13 +861,6 @@ HTML_PAGE = r"""
         <button class="btn" data-filter="resolved">已完成</button>
       </div>
       <input id="search-input" class="search" data-testid="chat-input" placeholder="搜索标题 / 作者 / 内容..." />
-    </section>
-
-    <section class="card api-tip">
-GET /api/threads?status=all|pending|resolved&limit=N
-GET /api/threads/{id}
-GET /api/actionable?author=developer_ai|reviewer_ai&limit=N
-GET /events  (SSE, alias of /api/events)
     </section>
 
     <section id="thread-list" class="threads" data-testid="chat-stream">
