@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_API_BASE = "http://localhost:8090"
 
@@ -32,6 +33,32 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Test evidence line. Can repeat --test multiple times.",
+    )
+    parser.add_argument(
+        "--run-test-cmd",
+        action="append",
+        default=[],
+        help=(
+            "Run a real test command before posting. "
+            "Can repeat --run-test-cmd multiple times."
+        ),
+    )
+    parser.add_argument(
+        "--test-timeout-sec",
+        type=float,
+        default=600.0,
+        help="Timeout in seconds for each --run-test-cmd command.",
+    )
+    parser.add_argument(
+        "--max-test-output-lines",
+        type=int,
+        default=3,
+        help="How many trailing output lines to include in failed test summary.",
+    )
+    parser.add_argument(
+        "--allow-no-tests",
+        action="store_true",
+        help="Allow posting without any test evidence (not recommended).",
     )
     parser.add_argument(
         "--changed-file",
@@ -72,6 +99,54 @@ def _format_bullet(items: List[str]) -> str:
     if not items:
         return "- (无)"
     return "\n".join(f"- {item}" for item in items)
+
+
+def _tail_lines(text: str, max_lines: int) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return " | ".join(lines[-max(1, max_lines):])
+
+
+def _run_test_commands(
+    commands: List[str],
+    timeout_sec: float,
+    max_output_lines: int,
+) -> Tuple[List[str], List[str]]:
+    evidence: List[str] = []
+    failed: List[str] = []
+    for raw in commands:
+        cmd = raw.strip()
+        if not cmd:
+            continue
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                executable="/bin/zsh",
+                text=True,
+                capture_output=True,
+                timeout=max(1.0, timeout_sec),
+            )
+        except subprocess.TimeoutExpired:
+            line = f"`{cmd}` -> FAIL (timeout {timeout_sec:.0f}s)"
+            evidence.append(line)
+            failed.append(line)
+            continue
+
+        if proc.returncode == 0:
+            evidence.append(f"`{cmd}` -> PASS")
+            continue
+
+        merged = "\n".join(x for x in [proc.stdout, proc.stderr] if x)
+        tail = _tail_lines(merged, max_output_lines)
+        if tail:
+            fail_line = f"`{cmd}` -> FAIL (code {proc.returncode}): {tail}"
+        else:
+            fail_line = f"`{cmd}` -> FAIL (code {proc.returncode})"
+        evidence.append(fail_line)
+        failed.append(fail_line)
+    return evidence, failed
 
 
 def _build_reply_body(
@@ -120,11 +195,46 @@ def _resolve_status_if_needed(args: argparse.Namespace, api_base: str, note: str
 def main() -> int:
     args = _parse_args()
     api_base = args.api_base.rstrip("/")
+    auto_test_evidence, failed_cmds = _run_test_commands(
+        commands=args.run_test_cmd,
+        timeout_sec=args.test_timeout_sec,
+        max_output_lines=max(1, int(args.max_test_output_lines)),
+    )
+    manual_test_evidence = [x.strip() for x in args.test if x and x.strip()]
+    all_test_evidence = auto_test_evidence + manual_test_evidence
+
+    if failed_cmds:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "test commands failed, reply blocked",
+                    "failed": failed_cmds,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
+    if not all_test_evidence and not args.allow_no_tests:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "no test evidence; provide --run-test-cmd/--test, "
+                        "or use --allow-no-tests explicitly"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 2
 
     reply_body = _build_reply_body(
         summary=args.summary,
         changed_files=args.changed_file,
-        tests=args.test,
+        tests=all_test_evidence,
         details=args.details,
         note=args.note,
     )

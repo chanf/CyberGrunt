@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +20,8 @@ class TestTestabilityHelpers(unittest.TestCase):
             main_mod.EventBus._clients = {}
         with main_mod._RECENT_ERROR_LOCK:
             main_mod._RECENT_ERROR = None
+        with main_mod._ACTIVE_TASKS_LOCK:
+            main_mod._ACTIVE_TASKS = {}
 
     def test_error_snapshot_contract(self):
         try:
@@ -58,6 +61,7 @@ class TestTestabilityHelpers(unittest.TestCase):
         self.assertIn("active_connections", payload)
         self.assertIn("loaded_limbs", payload)
         self.assertIn("recent_error", payload)
+        self.assertIn("active_tasks", payload)
         self.assertIn("ts", payload)
 
         loaded = main_mod._loaded_limb_names()
@@ -70,9 +74,11 @@ class TestTestabilityHelpers(unittest.TestCase):
         markers = [
             'data-testid="chat-input"',
             'data-testid="send-button"',
+            'data-testid="stop-button"',
             'data-testid="chat-stream"',
             'data-testid="system-status-bar"',
             'data-testid="log-stream"',
+            "log-event-thought",
             "log-event-tool-call",
             "log-event-tool-success",
             "log-event-llm-timeout",
@@ -81,6 +87,60 @@ class TestTestabilityHelpers(unittest.TestCase):
         ]
         for marker in markers:
             self.assertIn(marker, html)
+
+    def test_structured_event_mapping(self):
+        event = main_mod._structured_event_from_log("Thought: planning next action", None)
+        self.assertEqual(event[0], "thought")
+        self.assertEqual(event[1], "planning next action")
+
+        event = main_mod._structured_event_from_log("Action: Calling tool 'write_file' with args {}", None)
+        self.assertEqual(event[0], "tool_start")
+        self.assertEqual(event[2]["tool"], "write_file")
+
+        event = main_mod._structured_event_from_log("Result: done", "write_file")
+        self.assertEqual(event[0], "tool_end")
+        self.assertEqual(event[2]["status"], "ok")
+        self.assertEqual(event[2]["tool"], "write_file")
+
+    def test_request_task_stop_authorization(self):
+        class DummyThread:
+            ident = 123
+
+            @staticmethod
+            def is_alive():
+                return True
+
+        with main_mod._ACTIVE_TASKS_LOCK:
+            main_mod._ACTIVE_TASKS["sid_a"] = {
+                "thread": DummyThread(),
+                "owner_id": "owner_a",
+                "stop_requested": False,
+            }
+
+        forbidden = main_mod._request_task_stop("sid_a", "intruder")
+        self.assertFalse(forbidden["ok"])
+        self.assertEqual(forbidden["status_code"], 403)
+
+        with patch.object(main_mod, "_raise_async_exception", return_value=True):
+            allowed = main_mod._request_task_stop("sid_a", "owner_a")
+        self.assertTrue(allowed["ok"])
+        self.assertEqual(allowed["status_code"], 200)
+
+    def test_run_agent_task_abort_lifecycle(self):
+        events = []
+
+        def fake_publish(sid, event_type, content, extra=None):
+            events.append((event_type, content, extra))
+
+        with patch.object(main_mod.EventBus, "publish", side_effect=fake_publish):
+            with patch.object(main_mod.llm, "chat", side_effect=main_mod.TaskAbortRequested()):
+                main_mod.run_agent_task("sid_abort", "stop me")
+
+        event_types = [e[0] for e in events]
+        self.assertIn("lifecycle", event_types)
+        self.assertIn("done", event_types)
+        lifecycle = [e for e in events if e[0] == "lifecycle"][-1]
+        self.assertEqual((lifecycle[2] or {}).get("phase"), "aborted")
 
 
 if __name__ == "__main__":

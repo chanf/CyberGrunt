@@ -57,7 +57,8 @@ class TestAzureLLM(unittest.TestCase):
         body = json.loads(req.data.decode('utf-8'))
         self.assertNotIn("model", body)
         self.assertEqual(body["messages"], messages)
-        self.assertEqual(body["max_tokens"], 4000)  # default safety cap
+        token_cap = body.get("max_tokens", body.get("max_completion_tokens"))
+        self.assertEqual(token_cap, 4000)  # default safety cap
         self.assertNotIn("tools", body)  # empty tool_defs should not be sent
 
     @patch('urllib.request.urlopen')
@@ -82,6 +83,64 @@ class TestAzureLLM(unittest.TestCase):
         req = mock_urlopen.call_args[0][0]
         body = json.loads(req.data.decode("utf-8"))
         self.assertIn("tools", body)
+
+    @patch('urllib.request.urlopen')
+    def test_env_placeholders_are_expanded_for_azure(self, mock_urlopen):
+        env_config = {
+            "default": "azure_env",
+            "providers": {
+                "azure_env": {
+                    "type": "azure",
+                    "api_key": "${AZURE_OPENAI_API_KEY}",
+                    "api_base": "${AZURE_OPENAI_API_BASE}",
+                    "deployment_name": "${AZURE_OPENAI_DEPLOYMENT_NAME}",
+                    "api_version": "${AZURE_OPENAI_API_VERSION}"
+                }
+            }
+        }
+        llm.init(env_config, "/tmp", "admin", "/tmp/sessions")
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "Azure response"}}]
+        }).encode('utf-8')
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+        with patch.dict(os.environ, {
+            "AZURE_OPENAI_API_KEY": "env-key-123",
+            "AZURE_OPENAI_API_BASE": "https://env-resource.openai.azure.com",
+            "AZURE_OPENAI_DEPLOYMENT_NAME": "env-gpt-4o",
+            "AZURE_OPENAI_API_VERSION": "2024-05-01-preview",
+        }, clear=False):
+            llm._call_llm([{"role": "user", "content": "hello"}], [])
+
+        req = mock_urlopen.call_args[0][0]
+        expected_url = (
+            "https://env-resource.openai.azure.com/openai/deployments/"
+            "env-gpt-4o/chat/completions?api-version=2024-05-01-preview"
+        )
+        self.assertEqual(req.full_url, expected_url)
+        self.assertEqual(req.get_header("Api-key"), "env-key-123")
+
+    def test_unresolved_env_placeholder_raises_clear_error(self):
+        env_config = {
+            "default": "azure_env",
+            "providers": {
+                "azure_env": {
+                    "type": "azure",
+                    "api_key": "${AZURE_OPENAI_API_KEY}",
+                    "api_base": "${AZURE_OPENAI_API_BASE}",
+                    "deployment_name": "${AZURE_OPENAI_DEPLOYMENT_NAME}",
+                    "api_version": "${AZURE_OPENAI_API_VERSION}"
+                }
+            }
+        }
+        llm.init(env_config, "/tmp", "admin", "/tmp/sessions")
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as cm:
+                llm._call_llm([{"role": "user", "content": "hello"}], [])
+        self.assertIn("unresolved env vars", str(cm.exception))
 
 if __name__ == '__main__':
     unittest.main()

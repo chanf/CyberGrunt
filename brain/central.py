@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -48,6 +49,7 @@ def init(models_config, workspace, owner_id, sessions_dir):
 # ============================================================
 
 _RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _sanitize_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -68,6 +70,24 @@ def _sanitize_float(value: Any, default: float, minimum: float = 0.0) -> float:
     if fvalue < minimum:
         return default
     return fvalue
+
+
+def _expand_env_placeholders(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return _ENV_VAR_PATTERN.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
+
+
+def _assert_no_placeholders(value: Any, field_name: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    unresolved = sorted(set(_ENV_VAR_PATTERN.findall(value)))
+    if unresolved:
+        raise ValueError(
+            f"models config field '{field_name}' has unresolved env vars: "
+            f"{', '.join(unresolved)}"
+        )
+    return value
 
 
 def _resolve_provider_chain() -> List[Tuple[str, Dict[str, Any]]]:
@@ -116,34 +136,62 @@ def _get_provider():
 def _build_request_payload(provider: Dict[str, Any], messages: List[Dict[str, Any]], tool_defs: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str], Dict[str, Any], int]:
     if provider.get("type") == "azure":
         # Azure format: {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}
-        endpoint = str(provider["api_base"]).rstrip("/")
-        deployment = provider["deployment_name"]
-        version = provider.get("api_version", "2024-05-01-preview")
+        endpoint = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider["api_base"])),
+            "api_base",
+        ).rstrip("/")
+        deployment = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider["deployment_name"])),
+            "deployment_name",
+        )
+        version = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider.get("api_version", "2024-05-01-preview"))),
+            "api_version",
+        )
+        api_key = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider["api_key"])),
+            "api_key",
+        )
         url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}"
 
         headers = {
             "Content-Type": "application/json",
-            "api-key": provider["api_key"],
+            "api-key": api_key,
         }
     else:
         # Standard OpenAI-compatible format
-        url = str(provider["api_base"]).rstrip("/") + "/chat/completions"
+        endpoint = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider["api_base"])),
+            "api_base",
+        ).rstrip("/")
+        api_key = _assert_no_placeholders(
+            _expand_env_placeholders(str(provider["api_key"])),
+            "api_key",
+        )
+        url = endpoint + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {provider['api_key']}",
+            "Authorization": f"Bearer {api_key}",
         }
 
+    # 2. Build request body
     body: Dict[str, Any] = {"messages": messages}
     if tool_defs:
         body["tools"] = tool_defs
 
     # Default/cap max_tokens to improve compatibility across Azure deployments.
-    configured_max_tokens = _sanitize_int(provider.get("max_tokens", 4000), 4000, minimum=1)
-    body["max_tokens"] = min(configured_max_tokens, 4000)
+    # Note: Newer models require 'max_completion_tokens' instead of 'max_tokens'.
+    token_limit = _sanitize_int(provider.get("max_tokens", 4000), 4000, minimum=1)
+    
+    if provider.get("use_completion_tokens") or provider.get("type") == "azure":
+        body["max_completion_tokens"] = min(token_limit, 4000)
+    else:
+        body["max_tokens"] = min(token_limit, 4000)
 
     # Standard OpenAI requires 'model', but Azure embeds deployment in URL.
     if provider.get("type") != "azure":
-        body["model"] = provider.get("model", "gpt-3.5-turbo")
+        model = _expand_env_placeholders(provider.get("model", "gpt-3.5-turbo"))
+        body["model"] = _assert_no_placeholders(str(model), "model")
 
     extra = provider.get("extra_body", {})
     if isinstance(extra, dict):

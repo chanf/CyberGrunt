@@ -14,6 +14,8 @@ import traceback
 import threading
 import queue
 import urllib.parse
+import ctypes
+from typing import Any, Dict, Optional, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from datetime import datetime, timezone, timedelta
@@ -108,6 +110,12 @@ _ensure_forum_monitor_schedule()
 
 _RECENT_ERROR_LOCK = threading.Lock()
 _RECENT_ERROR = None
+_ACTIVE_TASKS_LOCK = threading.Lock()
+_ACTIVE_TASKS: Dict[str, Dict[str, Any]] = {}
+
+
+class TaskAbortRequested(Exception):
+    """Raised asynchronously to abort a running agent task."""
 
 
 def _record_recent_error(where, exc):
@@ -125,6 +133,117 @@ def _record_recent_error(where, exc):
 def _get_recent_error():
     with _RECENT_ERROR_LOCK:
         return dict(_RECENT_ERROR) if _RECENT_ERROR else None
+
+
+def _active_task_count() -> int:
+    with _ACTIVE_TASKS_LOCK:
+        return sum(
+            1
+            for task in _ACTIVE_TASKS.values()
+            if task.get("thread") and task["thread"].is_alive()
+        )
+
+
+def _register_active_task(sid: str, owner_id: str, worker: threading.Thread) -> Tuple[bool, str]:
+    with _ACTIVE_TASKS_LOCK:
+        existing = _ACTIVE_TASKS.get(sid)
+        if existing and existing.get("thread") and existing["thread"].is_alive():
+            return False, "task already running for this sid"
+        _ACTIVE_TASKS[sid] = {
+            "thread": worker,
+            "owner_id": owner_id,
+            "started_at": time.time(),
+            "stop_requested": False,
+        }
+        return True, ""
+
+
+def _clear_active_task(sid: str, worker: Optional[threading.Thread] = None) -> None:
+    with _ACTIVE_TASKS_LOCK:
+        existing = _ACTIVE_TASKS.get(sid)
+        if not existing:
+            return
+        if worker is not None and existing.get("thread") is not worker:
+            return
+        _ACTIVE_TASKS.pop(sid, None)
+
+
+def _raise_async_exception(thread_id: int, exc_type: type[BaseException]) -> bool:
+    result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(thread_id),
+        ctypes.py_object(exc_type),
+    )
+    if result == 0:
+        return False
+    if result > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), 0)
+        return False
+    return True
+
+
+def _request_task_stop(sid: str, requester_id: str) -> Dict[str, Any]:
+    with _ACTIVE_TASKS_LOCK:
+        task = _ACTIVE_TASKS.get(sid)
+        if not task:
+            return {"ok": False, "status_code": 404, "error": "no active task for sid"}
+
+        owner_id = str(task.get("owner_id", sid))
+        if requester_id != owner_id and requester_id not in OWNER_IDS:
+            return {"ok": False, "status_code": 403, "error": "not allowed to stop this task"}
+
+        worker = task.get("thread")
+        if not worker or not worker.is_alive() or worker.ident is None:
+            _ACTIVE_TASKS.pop(sid, None)
+            return {"ok": False, "status_code": 409, "error": "task is not running"}
+
+        task["stop_requested"] = True
+        target_thread_id = int(worker.ident)
+
+    interrupted = _raise_async_exception(target_thread_id, TaskAbortRequested)
+    if not interrupted:
+        return {"ok": False, "status_code": 409, "error": "failed to interrupt running task"}
+    return {"ok": True, "status_code": 200, "sid": sid}
+
+
+def _extract_tool_name(log_line: str) -> Optional[str]:
+    prefix = "Action: Calling tool '"
+    if not log_line.startswith(prefix):
+        return None
+    tail = log_line[len(prefix):]
+    end_idx = tail.find("'")
+    if end_idx <= 0:
+        return None
+    return tail[:end_idx]
+
+
+def _structured_event_from_log(
+    log_line: str,
+    last_tool: Optional[str],
+) -> Optional[Tuple[str, str, Dict[str, Any], Optional[str]]]:
+    raw = str(log_line or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("Thought:"):
+        thought = raw[len("Thought:"):].strip() or raw
+        return "thought", thought, {}, last_tool
+
+    tool_name = _extract_tool_name(raw)
+    if tool_name:
+        return "tool_start", raw, {"tool": tool_name}, tool_name
+
+    if raw.startswith("Result:"):
+        extra: Dict[str, Any] = {"status": "ok"}
+        if last_tool:
+            extra["tool"] = last_tool
+        return "tool_end", raw, extra, None
+
+    if raw.startswith("Error:"):
+        extra = {"status": "error"}
+        if last_tool:
+            extra["tool"] = last_tool
+        return "tool_end", raw, extra, None
+
+    return None
 
 # ============================================================
 #  2. Event Bus (The Message Backbone)
@@ -192,6 +311,7 @@ def _build_test_health_payload():
         "ok": True,
         "active_sessions": stats["active_sessions"],
         "active_connections": stats["active_connections"],
+        "active_tasks": _active_task_count(),
         "loaded_limbs": _loaded_limb_names(),
         "recent_error": _get_recent_error(),
         "ts": datetime.now(CST).isoformat(timespec="seconds"),
@@ -200,19 +320,37 @@ def _build_test_health_payload():
 
 def run_agent_task(sid, text):
     """The background worker that executes the agent loop."""
+    worker = threading.current_thread()
+    current_tool = None
+    done_message = "Task finished"
+
     def on_log(msg):
-        EventBus.publish(sid, "log", str(msg))
+        nonlocal current_tool
+        raw = str(msg)
+        EventBus.publish(sid, "log", raw)
+
+        structured = _structured_event_from_log(raw, current_tool)
+        if structured:
+            event_type, content, extra, next_tool = structured
+            current_tool = next_tool
+            EventBus.publish(sid, event_type, content, extra)
 
     try:
         log.info(f"[Task] Starting async task for {sid}: {text[:50]}")
         reply = llm.chat(text, f"web_{sid}", on_log=on_log)
         EventBus.publish(sid, "reply", reply)
+    except TaskAbortRequested:
+        done_message = "Task aborted"
+        log.info(f"[Task] Aborted by request for {sid}")
+        EventBus.publish(sid, "lifecycle", "Task aborted", {"phase": "aborted"})
     except Exception as e:
+        done_message = "Task failed"
         log.error(f"[Task] Error for {sid}: {e}", exc_info=True)
         _record_recent_error("run_agent_task", e)
         EventBus.publish(sid, "error", str(e))
     finally:
-        EventBus.publish(sid, "done", "Task finished")
+        _clear_active_task(sid, worker)
+        EventBus.publish(sid, "done", done_message)
 
 # ============================================================
 #  4. HTTP Server Logic
@@ -255,18 +393,40 @@ class AgentRouter(BaseHTTPRequestHandler):
             return
 
         if self.path == "/chat":
-            sid = data.get("sid", "default")
-            text = data.get("text", "").strip()
-            # 1. Immediately acknowledge the request
-            self._send_json(202, {"status": "accepted"})
-            
-            # 2. Fire up the background engine
-            threading.Thread(target=run_agent_task, args=(sid, text), daemon=True).start()
+            sid = str(data.get("sid", "default"))
+            text = str(data.get("text", "")).strip()
+            if not text:
+                self._send_json(400, {"error": "empty text"})
+                return
+            owner_id = str(data.get("owner_id", sid))
+
+            worker = threading.Thread(target=run_agent_task, args=(sid, text), daemon=True)
+            ok, reason = _register_active_task(sid, owner_id, worker)
+            if not ok:
+                self._send_json(409, {"error": reason, "sid": sid})
+                return
+
+            self._send_json(202, {"status": "accepted", "sid": sid})
+            worker.start()
+        elif self.path == "/api/task/stop":
+            self._handle_task_stop(data)
         else:
             self._send_json(404, {"error": "not found"})
 
     def handle_test_health(self):
         self._send_json(200, _build_test_health_payload())
+
+    def _handle_task_stop(self, data):
+        sid = str(data.get("sid", "")).strip()
+        if not sid:
+            self._send_json(400, {"error": "missing sid"})
+            return
+        requester_id = str(data.get("requester_id", sid)).strip() or sid
+        result = _request_task_stop(sid, requester_id)
+        if result.get("ok"):
+            self._send_json(200, {"ok": True, "sid": sid, "phase": "aborting"})
+            return
+        self._send_json(int(result.get("status_code", 500)), result)
 
     def handle_events(self, parsed):
         """Standard SSE endpoint using the EventBus subscription."""
@@ -332,6 +492,7 @@ HTML_UI = r"""
         #log-header { padding: 15px; color: white; font-weight: bold; border-bottom: 1px solid #333; font-size: 13px; }
         #log-view { flex: 1; overflow-y: auto; padding: 15px; font-family: 'SF Mono', monospace; font-size: 11px; line-height: 1.4; }
         .log-item { margin-bottom: 6px; border-left: 2px solid #444; padding-left: 10px; word-break: break-all; }
+        .log-event-thought { border-left-color: #8b5cf6; }
         .log-event-tool-call { border-left-color: #3b82f6; }
         .log-event-tool-success { border-left-color: #22c55e; }
         .log-event-llm-timeout { border-left-color: #f59e0b; }
@@ -354,6 +515,7 @@ HTML_UI = r"""
         #input-area { padding: 20px 30px; border-top: 1px solid #eee; display: flex; gap: 15px; background: white; z-index: 10; }
         input { flex: 1; padding: 14px 20px; border: 1px solid #ddd; border-radius: 25px; outline: none; font-size: 16px; }
         button { background: var(--accent); color: white; border: none; padding: 0 25px; border-radius: 25px; cursor: pointer; font-weight: bold; }
+        #stopBtn { background: #dc2626; display: none; }
         button:disabled { opacity: 0.5; }
 
         #system-status { position: absolute; bottom: 85px; left: 50%; transform: translateX(-50%); 
@@ -372,6 +534,7 @@ HTML_UI = r"""
         <div id="input-area" data-testid="input-area">
             <input type="text" id="userInput" data-testid="chat-input" placeholder="Send a command..." autocomplete="off">
             <button id="sendBtn" data-testid="send-button">Send</button>
+            <button id="stopBtn" data-testid="stop-button">Stop</button>
         </div>
     </div>
 
@@ -381,13 +544,24 @@ HTML_UI = r"""
             logs: document.getElementById('log-view'),
             input: document.getElementById('userInput'),
             btn: document.getElementById('sendBtn'),
+            stopBtn: document.getElementById('stopBtn'),
             status: document.getElementById('system-status')
         };
         const SID = Math.random().toString(36).substring(7);
         let isComposing = false; // Track Chinese IME state
+        let taskRunning = false;
 
         ui.input.addEventListener('compositionstart', () => { isComposing = true; });
         ui.input.addEventListener('compositionend', () => { isComposing = false; });
+
+        function setTaskRunning(running) {
+            taskRunning = !!running;
+            ui.btn.disabled = taskRunning;
+            ui.stopBtn.style.display = taskRunning ? 'inline-block' : 'none';
+            if (!taskRunning) {
+                ui.status.style.display = 'none';
+            }
+        }
 
         // --- Persistent Event Connection ---
         function connectEvents() {
@@ -400,14 +574,33 @@ HTML_UI = r"""
                         ui.status.style.display = 'block';
                         ui.status.textContent = 'Agent: ' + data.content.substring(0, 40) + '...';
                         break;
+                    case 'thought':
+                        ui.status.style.display = 'block';
+                        ui.status.textContent = 'Thought: ' + data.content;
+                        break;
+                    case 'tool_start':
+                        ui.status.style.display = 'block';
+                        ui.status.textContent = 'Tool running: ' + (data.tool || 'unknown');
+                        break;
+                    case 'tool_end':
+                        ui.status.style.display = 'block';
+                        ui.status.textContent = 'Tool finished: ' + (data.tool || 'unknown');
+                        break;
                     case 'reply':
                         addBubble('bot', data.content);
                         break;
                     case 'error':
                         addBubble('bot', '<strong>Error:</strong> ' + data.content);
+                        setTaskRunning(false);
+                        break;
+                    case 'lifecycle':
+                        if (data.phase === 'aborted') {
+                            addBubble('bot', '<strong>System:</strong> Task aborted.');
+                            setTaskRunning(false);
+                        }
                         break;
                     case 'done':
-                        ui.status.style.display = 'none';
+                        setTaskRunning(false);
                         break;
                 }
             };
@@ -430,6 +623,9 @@ HTML_UI = r"""
 
         function classifyLogEvent(txt) {
             const raw = String(txt || '');
+            if (raw.startsWith('Thought:')) {
+                return {className: 'log-event-thought', testId: 'log-event-thought'};
+            }
             if (raw.includes('[tool_quality]')) {
                 return {className: 'log-event-tool-quality', testId: 'log-event-tool-quality'};
             }
@@ -460,29 +656,49 @@ HTML_UI = r"""
 
         async function sendCommand() {
             const text = ui.input.value.trim();
-            if (!text || ui.btn.disabled) return;
+            if (!text || taskRunning) return;
 
             addBubble('user', text);
             ui.input.value = '';
-            ui.btn.disabled = true;
+            setTaskRunning(true);
 
             try {
                 const resp = await fetch('/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text: text, sid: SID})
+                    body: JSON.stringify({text: text, sid: SID, owner_id: SID})
                 });
                 if (!resp.ok) throw new Error("Connection failed");
-                // Reset button immediately - we are async now!
-                ui.btn.disabled = false;
                 ui.input.focus();
             } catch (err) {
                 addBubble('bot', '<strong>System:</strong> Failed to send command.');
-                ui.btn.disabled = false;
+                setTaskRunning(false);
+            }
+        }
+
+        async function stopTask() {
+            if (!taskRunning) return;
+            try {
+                const resp = await fetch('/api/task/stop', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({sid: SID, requester_id: SID})
+                });
+                const payload = await resp.json();
+                if (!resp.ok || !payload.ok) {
+                    const msg = payload.error || 'stop failed';
+                    addBubble('bot', '<strong>System:</strong> Stop failed: ' + msg);
+                    return;
+                }
+                ui.status.style.display = 'block';
+                ui.status.textContent = 'Stopping task...';
+            } catch (err) {
+                addBubble('bot', '<strong>System:</strong> Stop request failed.');
             }
         }
 
         ui.btn.onclick = sendCommand;
+        ui.stopBtn.onclick = stopTask;
         ui.input.onkeydown = (e) => { 
             if(e.key === 'Enter' && !isComposing) sendCommand(); 
         };

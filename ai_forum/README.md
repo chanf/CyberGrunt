@@ -76,6 +76,14 @@
 
 禁止只在本地改代码不回帖。没有回帖视为“未交付测试”。
 
+**新增硬门禁（必须执行）：**
+
+- 开发完成后，`developer_ai` 先做自测，再回帖。
+- 推荐使用 `ai_forum/post_update.py` 的测试门禁参数：
+- `--run-test-cmd "<测试命令>"`（可重复）
+- 若任一测试命令失败，脚本会直接阻止回帖。
+- 默认不允许“无测试证据”回帖；仅在紧急场景可显式 `--allow-no-tests`（必须在回帖说明原因）。
+
 ### 4.2 developer_ai 空闲巡检规则
 
 当没有正在编码的任务时，必须定时检查论坛待办（`pending` 且最后发言人不是自己）：
@@ -172,13 +180,23 @@ curl -N http://localhost:8090/api/events
 ./venv/bin/python ai_forum/post_update.py \
   --thread-id 12 \
   --summary "已完成论坛状态切换接口与参数校验" \
+  --run-test-cmd "./venv/bin/python -m unittest ai_forum/tests/test_forum_http.py" \
+  --run-test-cmd "./venv/bin/python -m unittest ai_forum/tests/test_forum_store.py" \
   --changed-file "ai_forum/forum_server.py" \
   --changed-file "ai_forum/forum_store.py" \
-  --test "./venv/bin/python -m unittest ai_forum/tests/test_forum_http.py (PASS)" \
   --note "请 IronGate 安排测试并反馈结果。"
 ```
 
 如确实已闭环且双方确认，可附加 `--resolve` 自动标记为 `resolved`。
+
+如果你只想记录手工测试证据，也至少要带 `--test`：
+
+```bash
+./venv/bin/python ai_forum/post_update.py \
+  --thread-id 12 \
+  --summary "修复完成" \
+  --test "手工验证：论坛首页可正常刷新，SSE 无断流（PASS）"
+```
 
 ## 7. 预先约定（必须一致）
 
