@@ -2,18 +2,20 @@
 Core Limbs - Essential system and file operations for CyberGrunt 2.0
 """
 
-import os
 import json
+import logging
+import os
 import subprocess
 import time
-import logging
-from limbs.hub import limb
+from typing import Any, Dict, List
+
 import messaging
 import scheduler
+from limbs.hub import limb
 
 log = logging.getLogger("agent")
 
-def _resolve_path(path, workspace):
+def _resolve_path(path: str, workspace: str) -> str:
     """
     Securely resolve path and ensure it stays within the workspace.
     Returns absolute path or raises PermissionError.
@@ -26,7 +28,7 @@ def _resolve_path(path, workspace):
         raise PermissionError(f"Access denied: path '{path}' is outside workspace")
     return target_path
 
-def _split_message(text, max_bytes=1800):
+def _split_message(text: str, max_bytes: int = 1800) -> List[str]:
     if len(text.encode("utf-8")) <= max_bytes:
         return [text]
     chunks, current = [], ""
@@ -47,8 +49,13 @@ def _split_message(text, max_bytes=1800):
       {"command": {"type": "string", "description": "Shell command to execute"},
        "timeout": {"type": "integer", "description": "Timeout in seconds, default 60, max 300"}},
       ["command"])
-def tool_exec(args, ctx):
-    timeout = min(args.get("timeout", 60), 300)
+def tool_exec(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    raw_timeout = args.get("timeout", 60)
+    try:
+        timeout = int(raw_timeout)
+    except (TypeError, ValueError):
+        timeout = 60
+    timeout = max(1, min(timeout, 300))
     try:
         result = subprocess.run(
             args["command"], shell=True, capture_output=True, text=True,
@@ -69,7 +76,7 @@ def tool_exec(args, ctx):
       "Used for scheduled task notifications. Normal conversation replies don't need this tool.",
       {"content": {"type": "string", "description": "Message content"}},
       ["content"])
-def tool_message(args, ctx):
+def tool_message(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     owner_id = ctx["owner_id"]
     chunks = _split_message(args["content"], 1800)
     for i, chunk in enumerate(chunks):
@@ -81,7 +88,7 @@ def tool_message(args, ctx):
 @limb("read_file", "Read file content. Path relative to workspace directory.",
       {"path": {"type": "string", "description": "File path (relative to workspace or absolute)"}},
       ["path"])
-def tool_read_file(args, ctx):
+def tool_read_file(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     try:
         fpath = _resolve_path(args["path"], ctx["workspace"])
         with open(fpath, "r", encoding="utf-8") as f:
@@ -100,7 +107,7 @@ def tool_read_file(args, ctx):
       {"path": {"type": "string", "description": "File path"},
        "content": {"type": "string", "description": "File content"}},
       ["path", "content"])
-def tool_write_file(args, ctx):
+def tool_write_file(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     try:
         fpath = _resolve_path(args["path"], ctx["workspace"])
         os.makedirs(os.path.dirname(fpath), exist_ok=True)
@@ -118,7 +125,7 @@ def tool_write_file(args, ctx):
        "old": {"type": "string", "description": "Original text to replace"},
        "new": {"type": "string", "description": "Replacement text"}},
       ["path", "old", "new"])
-def tool_edit_file(args, ctx):
+def tool_edit_file(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     try:
         fpath = _resolve_path(args["path"], ctx["workspace"])
         with open(fpath, "r", encoding="utf-8") as f:
@@ -139,7 +146,7 @@ def tool_edit_file(args, ctx):
 @limb("list_files", "List received and saved files. Filter by type (image/video/file/voice/gif) or list all.",
       {"type": {"type": "string", "description": "File type filter (image/video/file/voice/gif), empty for all"},
        "limit": {"type": "integer", "description": "Number of results (default 20)"}})
-def tool_list_files(args, ctx):
+def tool_list_files(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     index_path = os.path.join(ctx["workspace"], "files", "index.json")
     if not os.path.exists(index_path):
         return "No files received yet."
@@ -153,7 +160,11 @@ def tool_list_files(args, ctx):
     if file_type:
         index = [e for e in index if e.get("type") == file_type]
 
-    limit = args.get("limit", 20)
+    try:
+        limit = int(args.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, limit)
     recent = index[-limit:]
     recent.reverse()
 

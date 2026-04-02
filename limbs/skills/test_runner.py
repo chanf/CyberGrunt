@@ -1,11 +1,19 @@
 """Test Runner skill for IronGate (QA)."""
 
-import subprocess
-import os
+from __future__ import annotations
+
 import logging
+import os
+import subprocess
+from typing import Any, Dict
+
 from limbs.hub import limb
 
 log = logging.getLogger("agent")
+
+
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
 @limb(
@@ -22,12 +30,13 @@ log = logging.getLogger("agent")
         }
     }
 )
-def run_tests(args, ctx):
+def run_tests(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Run tests and return results."""
-    test_path = args.get("test_path", "")
-    verbose = args.get("verbose", False)
+    _ = ctx
+    test_path = str(args.get("test_path", ""))
+    verbose = bool(args.get("verbose", False))
 
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    base_dir = _project_root()
 
     cmd = ["python", "-m", "pytest", "-v"]
     if test_path:
@@ -72,9 +81,11 @@ def run_tests(args, ctx):
     description="List all test modules in the tests/ directory",
     properties={}
 )
-def list_test_modules(args, ctx):
+def list_test_modules(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """List all test modules in the project."""
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    _ = args
+    _ = ctx
+    base_dir = _project_root()
     tests_dir = os.path.join(base_dir, "tests")
 
     if not os.path.exists(tests_dir):
@@ -85,6 +96,7 @@ def list_test_modules(args, ctx):
         if file.startswith("test_") and file.endswith(".py"):
             modules.append(f"tests/{file}")
 
+    modules.sort()
     return {"modules": modules, "count": len(modules)}
 
 

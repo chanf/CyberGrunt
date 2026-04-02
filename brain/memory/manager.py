@@ -17,6 +17,7 @@ import time
 import urllib.request
 import uuid
 from datetime import datetime, timezone, timedelta
+from typing import Optional, Set, Tuple
 
 log = logging.getLogger("agent")
 CST = timezone(timedelta(hours=8))
@@ -31,6 +32,70 @@ _db = None          # LanceDB connection
 _table = None       # LanceDB memories table
 _enabled = False
 _context_cache = {} # session_key -> str (pre-computed memory summary, for zero-latency hardware channels)
+
+# Namespace scopes for shared memory mode (方案 B).
+_VALID_SCOPES = {"public", "qa", "dev", "ops", "context"}
+_SCOPE_PREFIX_SEP = "::"
+
+
+def _normalize_scope(scope: Optional[str], default: str = "context") -> str:
+    value = str(scope or "").strip().lower()
+    if value in _VALID_SCOPES:
+        return value
+    return default
+
+
+def _infer_role_scope(session_key: str) -> str:
+    sid = str(session_key or "").strip().lower()
+    if sid.startswith("web_"):
+        sid = sid[4:]
+
+    if any(token in sid for token in ("irongate", "reviewer", "qa")):
+        return "qa"
+    if any(token in sid for token in ("forge", "developer", "dev")):
+        return "dev"
+    if any(token in sid for token in ("shadow", "overseer", "ops")):
+        return "ops"
+    return "context"
+
+
+def _default_write_scope(session_key: str) -> str:
+    role_scope = _infer_role_scope(session_key)
+    if role_scope in ("qa", "dev", "ops"):
+        return role_scope
+    return "context"
+
+
+def _pack_storage_session_key(session_key: str, scope: str) -> str:
+    return "%s%s%s" % (_normalize_scope(scope), _SCOPE_PREFIX_SEP, session_key)
+
+
+def _unpack_storage_session_key(raw_session_key: str) -> Tuple[str, str]:
+    value = str(raw_session_key or "")
+    if _SCOPE_PREFIX_SEP in value:
+        prefix, sid = value.split(_SCOPE_PREFIX_SEP, 1)
+        if prefix in _VALID_SCOPES:
+            return prefix, sid
+    return "legacy", value
+
+
+def _readable_scopes_for_session(session_key: str) -> Set[str]:
+    allowed = {"public", "context"}
+    role_scope = _infer_role_scope(session_key)
+    if role_scope in ("qa", "dev", "ops"):
+        allowed.add(role_scope)
+    return allowed
+
+
+def _can_write_scope(session_key: str, scope: str, allow_public_write: bool) -> bool:
+    normalized = _normalize_scope(scope)
+    role_scope = _infer_role_scope(session_key)
+
+    if normalized == "public":
+        return allow_public_write
+    if normalized in ("qa", "dev", "ops"):
+        return normalized == role_scope
+    return normalized == "context"
 
 # ============================================================
 #  Public API (4 functions)
@@ -85,7 +150,7 @@ def init(config, llm_config, db_path):
         log.error("[memory] init failed: %s" % e, exc_info=True)
 
 
-def retrieve(user_msg, session_key, top_k=None):
+def retrieve(user_msg, session_key, top_k=None, scope="auto"):
     """Retrieve relevant memories, return formatted text block. Synchronous."""
     if not _enabled or not _table:
         return ""
@@ -105,9 +170,45 @@ def retrieve(user_msg, session_key, top_k=None):
         if not filtered:
             return ""
 
+        allowed_scopes = _readable_scopes_for_session(session_key)
+        if scope not in (None, "", "auto"):
+            requested_scope = _normalize_scope(scope)
+            if requested_scope not in allowed_scopes:
+                log.warning(
+                    "[memory] read scope denied: sid=%s requested=%s allowed=%s",
+                    session_key,
+                    requested_scope,
+                    sorted(allowed_scopes),
+                )
+                return ""
+            allowed_scopes = {requested_scope}
+
+        role_scope = _infer_role_scope(session_key)
+        visible = []
+        for record in filtered:
+            record_scope, record_sid = _unpack_storage_session_key(record.get("session_key", ""))
+            # Backward compatibility: old records were session-isolated only.
+            if record_scope == "legacy":
+                if record_sid != session_key:
+                    continue
+                record_scope = "context"
+
+            if record_scope not in allowed_scopes:
+                continue
+            if record_scope in ("qa", "dev", "ops") and record_scope != role_scope:
+                continue
+
+            copied = dict(record)
+            copied["_scope"] = record_scope
+            copied["_source_sid"] = record_sid
+            visible.append(copied)
+
+        if not visible:
+            return ""
+
         lines = ["[Relevant Memories]"]
-        for r in filtered:
-            line = "- " + r["fact"]
+        for r in visible:
+            line = "- [%s] %s" % (r.get("_scope", "context"), r["fact"])
             ts = r.get("timestamp", "")
             if ts:
                 line += " (%s)" % ts
@@ -118,10 +219,20 @@ def retrieve(user_msg, session_key, top_k=None):
         return ""
 
 
-def compress_async(evicted_messages, session_key):
+def compress_async(evicted_messages, session_key, scope=None, allow_public_write=False):
     """Start background thread to compress evicted messages into long-term memory."""
     if not _enabled:
         return
+    write_scope = _normalize_scope(scope, default=_default_write_scope(session_key))
+    if not _can_write_scope(session_key, write_scope, allow_public_write):
+        log.warning(
+            "[memory] write scope denied: sid=%s scope=%s allow_public_write=%s",
+            session_key,
+            write_scope,
+            allow_public_write,
+        )
+        return
+
     # Filter: keep only user and assistant text messages
     msgs = []
     for m in evicted_messages:
@@ -140,9 +251,9 @@ def compress_async(evicted_messages, session_key):
         # Too few messages, not worth compressing
         return
 
-    t = threading.Thread(target=_compress_worker, args=(msgs, session_key), daemon=True)
+    t = threading.Thread(target=_compress_worker, args=(msgs, session_key, write_scope), daemon=True)
     t.start()
-    log.info("[memory] compress started in background (%d messages)" % len(msgs))
+    log.info("[memory] compress started in background (%d messages, scope=%s)" % (len(msgs), write_scope))
 
 
 def get_cached_context(session_key):
@@ -291,7 +402,7 @@ def _cosine_similarity(a, b):
     return dot / (norm_a * norm_b)
 
 
-def _compress_worker(messages, session_key):
+def _compress_worker(messages, session_key, scope="context"):
     """Background thread: LLM extract -> embed -> deduplicate -> store in LanceDB"""
     try:
         dialogue = _format_messages(messages)
@@ -343,7 +454,7 @@ def _compress_worker(messages, session_key):
                 "persons": json.dumps(mem.get("persons", []), ensure_ascii=False),
                 "timestamp": mem.get("timestamp") or "",
                 "topic": mem.get("topic", ""),
-                "session_key": session_key,
+                "session_key": _pack_storage_session_key(session_key, scope),
                 "created_at": time.time(),
                 "vector": vec,
             })

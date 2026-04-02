@@ -72,7 +72,8 @@ class TestSkillsMemory(unittest.TestCase):
         mock_retrieve.assert_called_once_with(
             "history of AI", 
             self.ctx["session_key"], 
-            top_k=ANY
+            top_k=ANY,
+            scope="auto"
         )
         self.assertEqual(res, "Historical fact: AI is cool.")
 
@@ -82,6 +83,19 @@ class TestSkillsMemory(unittest.TestCase):
         mock_retrieve.return_value = None
         res = memory.tool_recall({"query": "something new"}, self.ctx)
         self.assertIn("No relevant memories found", res)
+
+    @patch('brain.memory.retrieve')
+    def test_recall_scope_override(self, mock_retrieve):
+        """Test recall scope override."""
+        mock_retrieve.return_value = "public memory"
+        res = memory.tool_recall({"query": "api docs", "scope": "public"}, self.ctx)
+        mock_retrieve.assert_called_once_with(
+            "api docs",
+            self.ctx["session_key"],
+            top_k=ANY,
+            scope="public"
+        )
+        self.assertEqual(res, "public memory")
 
 if __name__ == '__main__':
     unittest.main()

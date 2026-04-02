@@ -513,7 +513,17 @@ WORKFLOW_UI = r"""
         </div>
 
         <div class="workflow-list" id="workflow-list">
-            <div class="empty">加载中...</div>
+            <div class="empty">
+                <p>正在加载工作流...</p>
+                <small style="color: #888;">如果长时间无响应，请刷新页面</small>
+            </div>
+        </div>
+
+        <!-- 详情模态框 -->
+        <div id="detail-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 1000;">
+            <div style="background: white; border-radius: 12px; padding: 30px; max-width: 700px; max-height: 80vh; overflow-y: auto;">
+                <div id="detail-content"></div>
+            </div>
         </div>
     </div>
 
@@ -521,16 +531,24 @@ WORKFLOW_UI = r"""
         let workflows = [];
 
         function fetchWorkflows() {
-            const status = document.getElementById('filter-status').value;
-            const priority = document.getElementById('filter-priority').value;
-            const assignee = document.getElementById('filter-assignee').value;
-
-            let url = '/api/workflows?';
-            if (status) url += `status=${status}&`;
-            if (priority) url += `priority=${priority}&`;
-            if (assignee) url += `assignee=${assignee}&`;
-
-            return fetch(url).then(r => r.json());
+            // 简化 URL 构建，直接获取所有工作流
+            return fetch('/api/workflows', { cache: 'no-cache' })
+                .then(r => {
+                    console.log('Fetch response:', r.status);
+                    if (!r.ok) {
+                        throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+                    }
+                    return r.json();
+                })
+                .then(data => {
+                    console.log('Workflows data:', data);
+                    return data;
+                })
+                .catch(err => {
+                    console.error('Fetch error:', err);
+                    // 返回空数据而不是抛出错误
+                    return { workflows: [], error: err.message };
+                });
         }
 
         function renderWorkflows() {
@@ -600,7 +618,62 @@ WORKFLOW_UI = r"""
         }
 
         function viewWorkflow(id) {
-            window.open(`/api/workflows/${id}`, '_blank');
+            // 显示详情模态框
+            const modal = document.getElementById('detail-modal');
+            const content = document.getElementById('detail-content');
+
+            content.innerHTML = '<p>加载中...</p>';
+            modal.style.display = 'flex';
+
+            fetch(`/api/workflows/${id}`)
+                .then(r => r.json())
+                .then(data => {
+                    const wf = data.workflow;
+                    const comments = data.comments || [];
+
+                    let commentsHtml = comments.length > 0
+                        ? comments.map(c => `
+                            <div style="margin-bottom: 10px; padding: 10px; background: #f5f5f7; border-radius: 8px;">
+                                <strong>${c.author}</strong> <small>(${c.created_at})</small>
+                                <p style="margin: 5px 0 0 0;">${c.body}</p>
+                            </div>
+                        `).join('')
+                        : '<p style="color: #888;">暂无评论</p>';
+
+                    content.innerHTML = `
+                        <h2>${wf.title}</h2>
+                        <div style="display: flex; gap: 10px; margin: 10px 0;">
+                            <span class="badge ${wf.priority}">${wf.priority.toUpperCase()}</span>
+                            <span class="badge ${wf.status}">${wf.status}</span>
+                        </div>
+                        <div style="margin: 15px 0;">
+                            <strong>描述:</strong>
+                            <p style="margin-top: 5px;">${wf.description}</p>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 10px 0;">
+                            <div><strong>类型:</strong> ${wf.type}</div>
+                            <div><strong>优先级:</strong> ${wf.priority}</div>
+                            <div><strong>负责人:</strong> ${wf.assignee || '未认领'}</div>
+                            <div><strong>创建者:</strong> ${wf.created_by}</div>
+                            <div><strong>预估工时:</strong> ${wf.estimate_hours || '-'}h</div>
+                            <div><strong>评论数:</strong> ${wf.comment_count || 0}</div>
+                        </div>
+                        <div style="margin-top: 20px;">
+                            <h3>评论</h3>
+                            ${commentsHtml}
+                        </div>
+                        <div style="margin-top: 20px;">
+                            <button onclick="closeModal()" style="padding: 8px 16px; background: #64748b; color: white; border: none; border-radius: 6px; cursor: pointer;">关闭</button>
+                        </div>
+                    `;
+                })
+                .catch(err => {
+                    content.innerHTML = '<p style="color: red;">加载失败: ' + err.message + '</p>';
+                });
+        }
+
+        function closeModal() {
+            document.getElementById('detail-modal').style.display = 'none';
         }
 
         function showCreateModal() {
@@ -636,22 +709,23 @@ WORKFLOW_UI = r"""
             });
         }
 
-        // SSE events
+        // SSE events (temporarily disabled for debugging)
         function connectEvents() {
-            const ev = new EventSource('/events');
-            ev.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                console.log('Event:', data.type, data.content);
-                refreshWorkflows();
-            };
-            ev.onerror = () => {
-                setTimeout(connectEvents, 2000);
-            };
+            // Disabled - will enable later
+            console.log('SSE disabled for debugging');
         }
 
-        // Initial load
-        renderWorkflows();
-        connectEvents();
+        // Initial load with timeout
+        setTimeout(() => {
+            console.log('Starting to load workflows...');
+            renderWorkflows();
+        }, 100);
+
+        // Auto-refresh every 30 seconds
+        setInterval(() => {
+            console.log('Auto-refreshing workflows...');
+            renderWorkflows();
+        }, 30000);
     </script>
 </body>
 </html>

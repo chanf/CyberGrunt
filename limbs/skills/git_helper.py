@@ -1,11 +1,19 @@
 """Git helper skill for Forge (Developer)."""
 
-import subprocess
-import os
+from __future__ import annotations
+
 import logging
+import os
+import subprocess
+from typing import Any, Dict, List
+
 from limbs.hub import limb
 
 log = logging.getLogger("agent")
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
 @limb(
@@ -13,12 +21,15 @@ log = logging.getLogger("agent")
     description="Get git status showing modified, added, deleted, and untracked files",
     properties={}
 )
-def git_status(args, ctx):
+def git_status(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Get git status."""
+    _ = args
+    _ = ctx
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True,
-        text=True
+        text=True,
+        cwd=_repo_root(),
     )
 
     lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
@@ -47,14 +58,15 @@ def git_status(args, ctx):
         }
     }
 )
-def git_diff(args, ctx):
+def git_diff(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Get git diff."""
-    file_path = args.get("file_path", "")
+    _ = ctx
+    file_path = str(args.get("file_path", ""))
     cmd = ["git", "diff"]
     if file_path:
         cmd.append(file_path)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=_repo_root())
     return {"diff": result.stdout, "file": file_path or "all"}
 
 
@@ -68,16 +80,22 @@ def git_diff(args, ctx):
         }
     }
 )
-def git_log(args, ctx):
+def git_log(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Get recent git log."""
-    limit = args.get("limit", 10)
+    _ = ctx
+    try:
+        limit = int(args.get("limit", 10))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 100))
     result = subprocess.run(
         ["git", "log", f"-{limit}", "--pretty=format:%H|%an|%ad|%s", "--date=short"],
         capture_output=True,
-        text=True
+        text=True,
+        cwd=_repo_root(),
     )
 
-    commits = []
+    commits: List[Dict[str, str]] = []
     for line in result.stdout.strip().split("\n"):
         if line:
             parts = line.split("|", 3)
@@ -102,15 +120,18 @@ def git_log(args, ctx):
         }
     }
 )
-def git_add(args, ctx):
+def git_add(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Stage files for commit."""
-    files_str = args.get("files", "")
+    _ = ctx
+    files_str = str(args.get("files", ""))
     if not files_str:
         return {"success": False, "error": "No files specified"}
 
-    files = [f.strip() for f in files_str.split(",")]
+    files = [f.strip() for f in files_str.split(",") if f.strip()]
+    if not files:
+        return {"success": False, "error": "No valid files specified"}
     cmd = ["git", "add"] + files
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=_repo_root())
     return {
         "success": result.returncode == 0,
         "files": files,
@@ -128,16 +149,18 @@ def git_add(args, ctx):
         }
     }
 )
-def git_commit(args, ctx):
+def git_commit(args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
     """Create a commit."""
-    message = args.get("message", "")
+    _ = ctx
+    message = str(args.get("message", ""))
     if not message:
         return {"success": False, "error": "Commit message is required"}
 
     result = subprocess.run(
         ["git", "commit", "-m", message],
         capture_output=True,
-        text=True
+        text=True,
+        cwd=_repo_root(),
     )
     return {
         "success": result.returncode == 0,

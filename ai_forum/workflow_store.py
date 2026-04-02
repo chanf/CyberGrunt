@@ -126,7 +126,10 @@ class WorkflowStore:
                 )
                 workflow_id = cursor.lastrowid
                 conn.commit()
-                return self.get_workflow_by_id(workflow_id)
+
+                # Return the created workflow directly from DB
+                row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -138,7 +141,7 @@ class WorkflowStore:
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
                 if not row:
                     raise ValueError(f"Workflow {workflow_id} not found")
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -195,7 +198,7 @@ class WorkflowStore:
             conn = self._get_conn()
             try:
                 rows = conn.execute(query, params).fetchall()
-                return [self._workflow_from_row(row) for row in rows]
+                return [self._workflow_from_row(row, conn) for row in rows]
             finally:
                 conn.close()
 
@@ -254,7 +257,7 @@ class WorkflowStore:
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
                 if not row:
                     raise ValueError(f"Workflow {workflow_id} not found")
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -291,7 +294,7 @@ class WorkflowStore:
 
                 # Return updated workflow
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -323,7 +326,7 @@ class WorkflowStore:
 
                 # Return updated workflow
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -358,7 +361,7 @@ class WorkflowStore:
 
                 # Return updated workflow
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -400,7 +403,7 @@ class WorkflowStore:
 
                 # Return updated workflow
                 row = conn.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,)).fetchone()
-                return self._workflow_from_row(row)
+                return self._workflow_from_row(row, conn)
             finally:
                 conn.close()
 
@@ -416,7 +419,10 @@ class WorkflowStore:
             try:
                 comment_id = self._add_comment_internal(conn, workflow_id, author, comment_type, body)
                 conn.commit()
-                return self.get_comment_by_id(comment_id)
+
+                # Return the created comment directly from DB
+                row = conn.execute("SELECT * FROM workflow_comments WHERE id = ?", (comment_id,)).fetchone()
+                return self._comment_from_row(row)
             finally:
                 conn.close()
 
@@ -465,8 +471,16 @@ class WorkflowStore:
 
     # ==================== Helpers ====================
 
-    def _workflow_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _workflow_from_row(self, row: sqlite3.Row, conn: sqlite3.Connection = None) -> Dict[str, Any]:
         """Convert database row to workflow dict."""
+        # Count comments - use provided conn to avoid nested locks
+        comment_count = 0
+        if conn:
+            count_row = conn.execute(
+                "SELECT COUNT(*) as count FROM workflow_comments WHERE workflow_id = ?", (row["id"],)
+            ).fetchone()
+            comment_count = count_row["count"] if count_row else 0
+
         return {
             "id": row["id"],
             "title": row["title"],
@@ -485,7 +499,7 @@ class WorkflowStore:
             "actual_hours": row["actual_hours"],
             "related_thread_id": row["related_thread_id"],
             "blocked_by_id": row["blocked_by_id"],
-            "comment_count": self._count_comments(row["id"]),
+            "comment_count": comment_count,
         }
 
     def _comment_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:

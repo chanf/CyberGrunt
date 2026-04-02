@@ -2,17 +2,21 @@
 Memory Skill - Keyword search and semantic recall for CyberGrunt 2.0
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
+from typing import Any, Dict
+
 from limbs.hub import limb
 
 @limb("search_memory", "Search memory files. Uses keyword search in workspace/memory/ directory.",
       {"query": {"type": "string", "description": "Search keywords (space-separated)"},
        "scope": {"type": "string", "description": "Search scope: all (default), long (MEMORY.md only), daily (daily logs only)"}},
       ["query"])
-def tool_search_memory(args, ctx):
-    query = args["query"]
-    scope = args.get("scope", "all")
+def tool_search_memory(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    query = str(args["query"])
+    scope = str(args.get("scope", "all"))
     memory_dir = os.path.join(ctx["workspace"], "memory")
 
     if not os.path.isdir(memory_dir):
@@ -43,9 +47,15 @@ def tool_search_memory(args, ctx):
         return "[error] Search failed: %s" % e
 
 @limb("recall", "Semantic search in long-term memory. Recall historical facts or previous conversations.",
-      {"query": {"type": "string", "description": "Search keywords or question"}},
+      {"query": {"type": "string", "description": "Search keywords or question"},
+       "scope": {"type": "string", "description": "Namespace scope: auto (default), public, context, qa, dev, ops"}},
       ["query"])
-def tool_recall(args, ctx):
+def tool_recall(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     from brain import memory as mem_mod
-    result = mem_mod.retrieve(args['query'], ctx['session_key'], top_k=5)
+    result = mem_mod.retrieve(
+        str(args["query"]),
+        str(ctx["session_key"]),
+        top_k=5,
+        scope=args.get("scope", "auto"),
+    )
     return result or 'No relevant memories found.'

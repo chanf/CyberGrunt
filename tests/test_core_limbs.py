@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import sys
+import json
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,6 +85,22 @@ class TestCoreLimbs(unittest.TestCase):
         """Test list_files when index.json is missing."""
         res = base.tool_list_files({}, self.ctx)
         self.assertEqual(res, "No files received yet.")
+
+    def test_list_files_invalid_limit_fallback(self):
+        """Test list_files falls back when limit is not an integer."""
+        files_dir = os.path.join(self.test_dir, "files")
+        os.makedirs(files_dir, exist_ok=True)
+        index_path = os.path.join(files_dir, "index.json")
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump([
+                {"type": "file", "filename": "a.txt", "size": 128, "time": "2026-04-02", "path": "files/a.txt"},
+                {"type": "file", "filename": "b.txt", "size": 256, "time": "2026-04-02", "path": "files/b.txt"},
+            ], f)
+
+        res = base.tool_list_files({"limit": "oops"}, self.ctx)
+        self.assertIn("showing 2 most recent", res)
+        self.assertIn("a.txt", res)
+        self.assertIn("b.txt", res)
 
     def test_path_traversal_security(self):
         """Test that path traversal attempts are blocked."""

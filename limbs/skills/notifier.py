@@ -2,7 +2,10 @@
 Notifier & Scheduler Skill - Managing tasks and rich notifications for CyberGrunt 2.0
 """
 
-import time
+from __future__ import annotations
+
+from typing import Any, Dict
+
 from limbs.hub import limb
 import messaging
 import scheduler
@@ -15,24 +18,28 @@ import scheduler
        "cron_expr": {"type": "string", "description": "Cron expression (recurring task, e.g. '0 9 * * *')"},
        "once": {"type": "boolean", "description": "Execute only once (default true, only for cron_expr)"}},
       ["name", "message"])
-def tool_schedule(args, ctx):
+def tool_schedule(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = ctx
     return scheduler.add(args)
 
 @limb("list_schedules", "List all scheduled tasks", {})
-def tool_list_schedules(args, ctx):
+def tool_list_schedules(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = args
+    _ = ctx
     return scheduler.list_all()
 
 @limb("remove_schedule", "Delete a scheduled task",
       {"name": {"type": "string", "description": "Task name"}},
       ["name"])
-def tool_remove_schedule(args, ctx):
+def tool_remove_schedule(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = ctx
     return scheduler.remove(args["name"])
 
 @limb("send_image", "Send an image to the owner. Supports HTTP URL or local file path.",
       {"path": {"type": "string", "description": "Image URL or local file path"},
        "caption": {"type": "string", "description": "Optional text caption"}},
       ["path"])
-def tool_send_image(args, ctx):
+def tool_send_image(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     # ctx['owner_id'] is injected by Brain
     result = messaging.upload_and_send(ctx["owner_id"], args["path"], args.get("caption", ""), ctx["workspace"])
     return "Image sent" if result.get("code") == 0 else f"[error] {result.get('msg')}"
@@ -43,6 +50,6 @@ def tool_send_image(args, ctx):
        "link_url": {"type": "string", "description": "Click-through URL"},
        "icon_url": {"type": "string", "description": "Card icon URL"}},
       ["title", "desc", "link_url"])
-def tool_send_link(args, ctx):
+def tool_send_link(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     result = messaging.send_link(ctx["owner_id"], args["title"], args["desc"], args["link_url"], args.get("icon_url", ""))
     return "Link sent" if result.get("code") == 0 else f"[error] {result.get('msg')}"

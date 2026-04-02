@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>工作流测试</title>
+</head>
+<body>
+    <h1>工作流系统测试</h1>
+    <button onclick="testAPI()">测试 API</button>
+    <button onclick="loadWorkflows()">加载工作流</button>
+    <div id="output"></div>
+
+    <script>
+        function log(msg) {
+            document.getElementById('output').innerHTML += '<p>' + msg + '</p>';
+        }
+
+        function testAPI() {
+            log('测试 API...');
+            fetch('/api/workflows')
+                .then(r => r.json())
+                .then(data => {
+                    log('✅ API 成功! 找到 ' + data.workflows.length + ' 个工作流');
+                })
+                .catch(err => {
+                    log('❌ API 失败: ' + err.message);
+                });
+        }
+
+        function loadWorkflows() {
+            log('加载工作流...');
+            fetch('/api/workflows')
+                .then(r => r.json())
+                .then(data => {
+                    log('找到 ' + data.workflows.length + ' 个工作流:');
+                    data.workflows.forEach(w => {
+                        log('  #' + w.id + ' ' + w.title + ' - ' + w.status);
+                    });
+                })
+                .catch(err => {
+                    log('❌ 加载失败: ' + err.message);
+                });
+        }
+
+        // 页面加载时自动测试
+        window.onload = function() {
+            log('页面已加载');
+            testAPI();
+        };
+    </script>
+</body>
+</html>

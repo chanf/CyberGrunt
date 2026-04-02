@@ -70,7 +70,8 @@
 - `[hub]`: 插件扫描与重载日志。
 
 ## 6. 演进路线
-- **Step 1**: 解决 Azure OpenAI 400 错误（当前重点：参数清洗）。
-- **Step 2**: 接入 SQLite MCP 实现结构化记忆。
-- **Step 3**: [当前进行中] 38个工具全量合规整改与“大模型容错”逻辑实现 (ReliableLLM)。
-- **Step 4**: 实现 Web 界面的任务终止与交互式参数确认。
+- **Step 3**: 38个工具全量合规整改与“大模型容错”逻辑实现 (ReliableLLM) -- 已完成。
+- **Step 4**: 实现 Web 界面的任务终止与交互式参数确认 -- 已完成。
+- **Step 5**: [当前进行中] 启动分层共享记忆库 (Layered Shared Memory)。
+  - 实现 `public/qa/dev/ops` 命名空间隔离。
+  - 确保 `recall` 工具支持跨 Scope 检索。

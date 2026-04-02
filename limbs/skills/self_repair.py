@@ -180,7 +180,8 @@ def _attempt_mcp_reconnect(force_reconnect: bool = False) -> Dict[str, Any]:
 
 @limb("self_check", "System self-check: collect today's conversation stats, system health, "
       "error logs, scheduled task status, etc. Used to generate daily self-check reports.", {})
-def tool_self_check(args, ctx):
+def tool_self_check(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = args
     now = datetime.now(CST)
     today = now.strftime("%Y-%m-%d")
     report = []
@@ -239,7 +240,7 @@ def tool_self_check(args, ctx):
 @limb("diagnose", "Diagnose system problems. Check session file health, MCP server status, error logs.",
       {"target": {"type": "string", "description": "Diagnosis target: 'session', 'mcp', 'all'"}},
       ["target"])
-def tool_diagnose(args, ctx):
+def tool_diagnose(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     target = args.get("target", "all")
     report = []
     
@@ -287,7 +288,7 @@ def tool_diagnose(args, ctx):
         },
     },
 )
-def tool_self_repair_loop(args, ctx):
+def tool_self_repair_loop(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     threshold_mb = int(args.get("disk_free_mb_threshold", _DEFAULT_DISK_THRESHOLD_MB))
     cleanup_limit_mb = int(args.get("cleanup_limit_mb", _DEFAULT_CLEANUP_LIMIT_MB))
     force_mcp_reconnect = bool(args.get("force_mcp_reconnect", False))
@@ -427,7 +428,7 @@ def tool_self_repair_loop(args, ctx):
         }
     },
 )
-def tool_self_repair_history(args, ctx):
+def tool_self_repair_history(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     limit = max(1, min(int(args.get("limit", 20)), 200))
     history_path = _history_path(ctx)
     if not os.path.exists(history_path):
@@ -478,7 +479,8 @@ def tool_self_repair_history(args, ctx):
       {"name": {"type": "string", "description": "Tool name (e.g. 'weather')"},
        "code": {"type": "string", "description": "Complete Python code with @limb decorator"}},
       ["name", "code"])
-def tool_create_tool(args, ctx):
+def tool_create_tool(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = ctx
     name = args["name"]
     code = args["code"]
     
@@ -505,7 +507,9 @@ def tool_create_tool(args, ctx):
         return f"[error] Failed to create tool: {e}"
 
 @limb("list_custom_tools", "List all custom tool plugins in plugins/ directory", {})
-def tool_list_custom_tools(args, ctx):
+def tool_list_custom_tools(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = args
+    _ = ctx
     if not os.path.isdir(_plugins_dir):
         return "No custom tools directory found."
     
@@ -525,7 +529,8 @@ def tool_list_custom_tools(args, ctx):
 @limb("remove_tool", "Delete a custom tool plugin. Persists across restarts.",
       {"name": {"type": "string", "description": "Tool name to delete"}},
       ["name"])
-def tool_remove_tool(args, ctx):
+def tool_remove_tool(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = ctx
     name = args["name"]
     fpath = os.path.join(_plugins_dir, f"{name}.py")
     
@@ -545,6 +550,8 @@ def tool_remove_tool(args, ctx):
         return f"[error] Failed to remove tool: {e}"
 
 @limb("reload_mcp", "Hot-reload MCP servers from config.json", {})
-def tool_reload_mcp(args, ctx):
+def tool_reload_mcp(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = args
+    _ = ctx
     added, removed, total = hub.reload_mcp()
     return f"MCP Reloaded: Added {len(added)}, Removed {len(removed)}, Total {total}"

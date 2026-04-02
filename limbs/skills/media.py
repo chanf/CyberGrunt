@@ -2,18 +2,18 @@
 Media Skill - Video and image generation for CyberGrunt 2.0
 """
 
-import os
 import json
+import logging
+import os
 import time
 import urllib.request
-import urllib.error
-import logging
+from typing import Any, Dict
+
 from limbs.hub import limb
-import messaging
 
 log = logging.getLogger("agent")
 
-def _video_output_path(workspace):
+def _video_output_path(workspace: str) -> str:
     os.makedirs(os.path.join(workspace, "files"), exist_ok=True)
     return os.path.join(workspace, "files", "video_%d.mp4" % int(time.time()))
 
@@ -22,7 +22,8 @@ def _video_output_path(workspace):
       {"prompt": {"type": "string", "description": "Video content description"},
        "size": {"type": "string", "description": "Video resolution, default 1280x720"}},
       ["prompt"])
-def tool_generate_video(args, ctx):
+def tool_generate_video(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    _ = ctx
     from limbs.hub import _extra_config
     video_cfg = _extra_config.get("video_api", {})
     api_key = video_cfg.get("api_key", "")
@@ -34,8 +35,8 @@ def tool_generate_video(args, ctx):
 
     body = json.dumps({
         "model": model,
-        "prompt": args["prompt"],
-        "size": args.get("size", "1280x720"),
+        "prompt": str(args["prompt"]),
+        "size": str(args.get("size", "1280x720")),
     }).encode("utf-8")
     
     req = urllib.request.Request(
