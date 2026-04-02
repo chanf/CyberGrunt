@@ -3,6 +3,7 @@
 > **注**：本项目基于 [wangziqi06/724-office](https://github.com/wangziqi06/724-office) 衍生并深度重构。感谢原作者提供的高质量核心代码参考。
 
 这是一个在生产环境运行的 AI 智能体，使用 **约 3,500 行纯 Python 代码** 构建，**零框架依赖**。
+
 没有 LangChain，没有 LlamaIndex，没有 CrewAI -- 仅使用标准库 + 3 个轻量级包（`croniter`, `lancedb`, `websocket-client`）。
 
 **26 个工具。8 个文件。24/7 全天候运行。**
@@ -130,26 +131,30 @@ AI 在论坛发帖时使用 `@execute` 命令：
 
 ```mermaid
 graph TD
-    User[用户 / 浏览器 / 消息平台] -->|HTTP POST /chat| Router[main.py: AgentRouter]
-    Router -->|启动异步任务| Task[main.py: run_agent_task]
-    Task -->|调用大脑| LLM[brain/central.py: llm.chat]
+    User[用户 / 消息平台] -->|HTTP/TG| Router[main.py: 入口网关]
+    Router -->|Async Task| LLM[brain/central.py: 决策大脑]
 
-    subgraph "大脑核心循环 (Brain Core Loop)"
-        LLM -->|请求| AI[LLM API / OpenAI / Vertex]
-        AI -->|工具调用| ToolCheck{是否请求工具?}
-        ToolCheck -->|是| Hub[limbs/hub.py: limbs_hub.execute]
-        Hub -->|本地分发| Local[limbs/core/ & limbs/skills/]
-        Hub -->|远程协议| MCP[mcp_client: 外部 MCP 服务]
-        Local -->|执行结果| LLM
-        MCP -->|执行结果| LLM
-        ToolCheck -->|否 / 最终回复| Finish[返回回复]
+    subgraph "自进化执行层 (Modular Limbs)"
+        LLM -->|分发| Hub[limbs/hub.py: 调度中心]
+        Hub -->|执行| Core[limbs/core: 文件/Shell]
+        Hub -->|执行| Skills[limbs/skills: 搜索/媒体/Git]
+        Hub -->|执行| MCP[mcp_client: 远程插件]
+        Hub -.->|监控| Metric[brain/tool_quality: 质量拦截器]
     end
 
-    LLM <-->|召回 / 压缩| Mem[brain/memory: 向量数据库]
-    LLM -.->|日志广播| Bus[main.py: EventBus]
-    Bus -->|SSE /events| User
+    subgraph "记忆与持久化"
+        LLM <-->|检索/压实| Mem[brain/memory: 向量库]
+        LLM <-->|持久化| Session[sessions/: JSON]
+    end
 
-    Sched[scheduler.py] -->|定时触发| LLM
+    subgraph "自愈与监控"
+        Sched[scheduler.py] -->|每日触发| Repair[self_repair_loop]
+        Repair -->|执行修复| Hub
+        Repair -->|输出历史| History[repair_history.jsonl]
+    end
+
+    LLM -.->|实时广播| Bus[main.py: EventBus]
+    Bus -->|SSE| User
 ```
 
 ## 工作原理

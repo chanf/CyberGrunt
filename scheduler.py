@@ -171,6 +171,35 @@ def _check():
 def _trigger(job):
     """Trigger task, notify owner on failure"""
     try:
+        # 特殊处理论坛监控任务
+        if job["name"] == "forum_health_monitor":
+            import subprocess
+            import os
+            import sys
+
+            monitor_script = os.path.join(os.path.dirname(__file__), "ai_forum", "forum_health_monitor.py")
+
+            # 使用 --once 参数运行一次检查
+            result = subprocess.run(
+                [sys.executable, monitor_script, "--once"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            log.info(f"[scheduler] {job['name']} executed: {result.stdout[-100:]}")
+
+            # 如果输出包含错误，通知人类
+            if "❌" in result.stdout:
+                try:
+                    _chat_fn(
+                        f"⚠️ 论坛监控任务发现问题：{result.stdout[-200:]}",
+                        "scheduler"
+                    )
+                except Exception:
+                    pass
+            return
+
         reply = _chat_fn(job["message"], "scheduler")
         log.info(f"[scheduler] {job['name']} OK: {reply[:100] if reply else '(empty)'}")
     except Exception as e:
@@ -182,7 +211,8 @@ def _trigger(job):
                 "scheduler"
             )
         except Exception:
-            pass  # Notification also failed, can only wait for next heartbeat
+            pass # Notification also failed, can only wait for next heartbeat
+
 
 
 def _log_heartbeat():

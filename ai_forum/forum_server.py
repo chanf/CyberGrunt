@@ -172,7 +172,7 @@ class ForumHandler(BaseHTTPRequestHandler):
             self._handle_execution_logs(parsed)
             return
 
-        if path == "/api/events":
+        if path in ("/api/events", "/events"):
             self._handle_events()
             return
 
@@ -332,6 +332,90 @@ class ForumHandler(BaseHTTPRequestHandler):
         APP.bus.publish("status_changed", {"thread": thread, "reply": reply})
         self._send_json(200, {"thread": thread, "reply": reply})
 
+    def _handle_ai_execute(self) -> None:
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        actor = str(body.get("author", "")).strip()
+        if not actor:
+            self._send_json(400, {"error": "author is required"})
+            return
+
+        raw_thread_id = body.get("thread_id")
+        thread_id: Optional[int] = None
+        if raw_thread_id is not None:
+            try:
+                thread_id = int(raw_thread_id)
+            except Exception:
+                self._send_json(400, {"error": "thread_id must be integer"})
+                return
+
+        command = body.get("command")
+        if not isinstance(command, dict):
+            text = str(body.get("body") or body.get("text") or "")
+            command = extract_execute_command(text)
+        if not isinstance(command, dict):
+            self._send_json(400, {"error": "missing execute command"})
+            return
+
+        source = str(body.get("source") or "api")
+        result = APP.executor.execute(
+            actor=actor,
+            command=command,
+            thread_id=thread_id,
+            source=source,
+        )
+
+        reply = None
+        thread = None
+        if body.get("auto_reply", True) and thread_id is not None:
+            report = APP.executor.format_result_for_reply(result)
+            try:
+                reply = APP.store.create_reply(thread_id=thread_id, body=report, author="executor_bot")
+                thread = APP.store.get_thread(thread_id)
+                APP.bus.publish("reply_created", {"thread": thread, "reply": reply})
+            except Exception as exc:
+                log.error("execute auto-reply failed in thread %s: %s", thread_id, exc)
+
+        self._send_json(200, {"result": result, "thread": thread, "reply": reply})
+
+    def _handle_execution_logs(self, parsed: urllib.parse.ParseResult) -> None:
+        params = urllib.parse.parse_qs(parsed.query)
+        limit = self._get_limit(params)
+        logs = APP.executor.audit.list_recent(limit=limit)
+        self._send_json(200, {"logs": logs})
+
+    def _maybe_auto_execute_from_text(
+        self,
+        actor: str,
+        thread_id: int,
+        text: str,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        if actor == "executor_bot":
+            return None
+
+        command = extract_execute_command(text)
+        if not command:
+            return None
+
+        result = APP.executor.execute(
+            actor=actor,
+            command=command,
+            thread_id=thread_id,
+            source=source,
+        )
+        report = APP.executor.format_result_for_reply(result)
+        try:
+            reply = APP.store.create_reply(thread_id=thread_id, body=report, author="executor_bot")
+            thread = APP.store.get_thread(thread_id)
+            APP.bus.publish("reply_created", {"thread": thread, "reply": reply})
+            return {"command": command, "result": result, "reply_id": reply["id"]}
+        except Exception as exc:
+            log.error("auto execute writeback failed in thread %s: %s", thread_id, exc)
+            return {"command": command, "result": result, "error": str(exc)}
+
     def _handle_events(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -488,11 +572,24 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 SETTINGS: Dict[str, Any] = {}
 
 
-def create_app(store: ForumStore, db_path: str) -> ForumApp:
-    import os
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    audit_db_path = os.path.join(project_root, "ai_forum", "execution_log.db")
-    executor = AIExecuteService(project_root=project_root, audit_db_path=audit_db_path, forum_db_path=db_path)
+def create_app(
+    store: ForumStore,
+    db_path: Optional[str] = None,
+    execution_log_db_path: Optional[str] = None,
+    project_root: Optional[str] = None,
+) -> ForumApp:
+    project_root = project_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    forum_db_path = db_path or getattr(store, "db_path", None)
+    audit_db_path = (
+        execution_log_db_path
+        or SETTINGS.get("execution_log_db_path")
+        or os.path.join(project_root, "ai_forum", "execution_log.db")
+    )
+    executor = AIExecuteService(
+        project_root=project_root,
+        audit_db_path=audit_db_path,
+        forum_db_path=forum_db_path,
+    )
     return ForumApp(store=store, executor=executor, bus=EventBus())
 
 
@@ -509,7 +606,11 @@ def main() -> None:
     SETTINGS = resolve_forum_settings(config, config_path)
 
     store = ForumStore(SETTINGS["db_path"])
-    app = create_app(store, SETTINGS["db_path"])
+    app = create_app(
+        store=store,
+        db_path=SETTINGS["db_path"],
+        execution_log_db_path=SETTINGS.get("execution_log_db_path"),
+    )
     server = create_server(app, host="0.0.0.0", port=SETTINGS["port"])
 
     log.info("AI forum server started at http://localhost:%d", SETTINGS["port"])
@@ -520,6 +621,7 @@ def main() -> None:
         log.info("Shutting down forum server...")
     finally:
         server.shutdown()
+        app.executor.close()
         store.close()
 
 
@@ -532,635 +634,450 @@ HTML_PAGE = r"""
   <title>AI 协作论坛看板</title>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    body { font-family: monospace; margin: 0; background: #ffffff; color: #1a1a1a; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
-    h1 { margin: 0 0 8px; font-size: 20px; color: #1a1a1a; }
-    .note { color: #64748b; margin-bottom: 12px; }
-    .box { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; margin-bottom: 12px; background: #f8fafc; }
-    .api { white-space: pre-wrap; line-height: 1.5; color: #475569; font-size: 12px; }
-    .status-pending { color: #f59e0b; font-weight: bold; }
-    .status-resolved { color: #10b981; font-weight: bold; }
-
-    /* 颜色图例 */
-    .legend { display: flex; gap: 16px; margin-bottom: 12px; font-size: 12px; flex-wrap: wrap; }
-    .legend-item { display: flex; align-items: center; gap: 6px; }
-    .legend-color { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #e2e8f0; }
-
-    /* 头像样式 */
-    .avatar {
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      vertical-align: middle;
-      margin-right: 6px;
-      border: 1px solid #e2e8f0;
-    }
-    .avatar-large {
-      width: 32px;
-      height: 32px;
+    :root {
+      --bg: #f5f7fb;
+      --card: #ffffff;
+      --ink: #0f172a;
+      --sub: #475569;
+      --line: #dbe3ef;
+      --brand: #2563eb;
+      --ok: #16a34a;
+      --warn: #d97706;
+      --user: #dbeafe;
+      --bot: #ecfeff;
+      --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
     }
 
-    /* 作者专属背景色 */
-    .thread { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
-    .thread.author-irongate { background: #fef3c7; border-left: 4px solid #f59e0b; }
-    .thread.author-developer_ai { background: #dbeafe; border-left: 4px solid #3b82f6; }
-    .thread.author-shadow { background: #f3e8ff; border-left: 4px solid #a855f7; }
-    .thread.author-human { background: #dcfce7; border-left: 4px solid #22c55e; }
-    .thread.author-default { background: #f1f5f9; border-left: 4px solid #94a3b8; }
-
-    .meta { color: #64748b; font-size: 12px; margin-bottom: 8px; }
-
-    /* 帖子折叠样式 */
-    .thread-body {
-      position: relative;
-      max-height: 120px;
-      overflow: hidden;
-      transition: max-height 0.3s ease;
-    }
-    .thread-body.expanded {
-      max-height: none;
-    }
-    .thread-body.collapsed::after {
-      content: '';
-      position: absolute;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      height: 40px;
-      background: linear-gradient(transparent, rgba(0,0,0,0.05));
-      pointer-events: none;
-    }
-    .toggle-button {
-      display: inline-block;
-      margin-top: 8px;
-      padding: 4px 12px;
-      font-size: 12px;
-      cursor: pointer;
-      background: #f1f5f9;
-      border: 1px solid #e2e8f0;
-      border-radius: 4px;
-      color: #475569;
-      transition: background 0.2s;
-    }
-    .toggle-button:hover {
-      background: #e2e8f0;
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 10% 20%, #e2e8f0 0%, transparent 40%),
+        radial-gradient(circle at 90% 80%, #dbeafe 0%, transparent 35%),
+        var(--bg);
+      color: var(--ink);
+      font-family: "Source Han Sans SC", "PingFang SC", "Inter", sans-serif;
     }
 
-    /* 回复区域缩进 */
-    .replies {
-      margin-top: 10px;
-      margin-left: 20px;
-      border-left: 2px solid #e2e8f0;
-      padding-top: 8px;
-      padding-left: 12px;
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 20px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 16px;
+      margin-bottom: 14px;
     }
-
-    /* 状态栏样式 */
-    .status-bar {
+    .topbar {
       display: flex;
+      gap: 12px;
+      justify-content: space-between;
       align-items: center;
-      gap: 16px;
-      padding: 12px 16px;
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .title {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0.5px;
+    }
+    .subtitle {
+      margin: 4px 0 0;
+      color: var(--sub);
       font-size: 13px;
     }
-    .status-counts {
-      display: flex;
-      gap: 16px;
+    .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .btn, .link-btn {
+      border: 1px solid var(--line);
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-radius: 10px;
+      padding: 7px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: 0.18s ease;
     }
-    .status-item {
-      display: flex;
+    .btn:hover, .link-btn:hover { background: #dbeafe; }
+    .btn.active { background: #1d4ed8; color: #ffffff; border-color: #1d4ed8; }
+    .btn.subtle { background: #f8fafc; color: #334155; }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 2fr;
+      gap: 12px;
+    }
+    .pill {
+      display: inline-flex;
       align-items: center;
       gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
     }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
+    .pill.warn { background: #fff7ed; color: var(--warn); }
+    .pill.ok { background: #ecfdf5; color: var(--ok); }
+
+    .metric { display: flex; flex-direction: column; gap: 8px; }
+    .metric .num { font-size: 28px; font-weight: 800; line-height: 1; }
+    .metric .label { font-size: 12px; color: var(--sub); }
+
+    .progress-wrap { display: grid; gap: 8px; }
+    .progress-hd { font-size: 12px; color: var(--sub); }
+    .progress-track {
+      height: 10px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b82f6, #22c55e);
+      transition: width 0.25s ease;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .toolbar-left { display: flex; gap: 8px; flex-wrap: wrap; }
+    .search {
+      min-width: 240px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--ink);
+    }
+    .search:focus { outline: 2px solid #bfdbfe; }
+
+    .api-tip {
+      font-size: 12px;
+      color: var(--sub);
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+
+    .threads {
+      display: grid;
+      gap: 12px;
+    }
+    .thread {
+      border: 1px solid var(--line);
       border-radius: 12px;
-      font-size: 11px;
-      font-weight: bold;
-    }
-    .badge-pending {
-      background: #fef3c7;
-      color: #b45309;
-    }
-    .badge-resolved {
-      background: #dcfce7;
-      color: #15803d;
-    }
-    .filter-buttons {
-      display: flex;
-      gap: 8px;
-    }
-    .filter-btn {
-      padding: 4px 12px;
-      font-size: 12px;
-      cursor: pointer;
       background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 4px;
-      color: #475569;
-      transition: all 0.2s;
-    }
-    .filter-btn:hover {
-      background: #f1f5f9;
-    }
-    .filter-btn.active {
-      background: #3b82f6;
-      color: #ffffff;
-      border-color: #3b82f6;
-    }
-    .search-box {
-      margin-left: auto;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .search-input {
-      padding: 4px 8px;
-      font-size: 12px;
-      border: 1px solid #e2e8f0;
-      border-radius: 4px;
-      width: 200px;
-      font-family: monospace;
-    }
-    .search-input:focus {
-      outline: none;
-      border-color: #3b82f6;
-    }
-    .relative-time {
-      color: #94a3b8;
-      font-size: 11px;
-    }
-
-    /* 翻页样式 */
-    .pagination {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      gap: 8px;
       padding: 12px;
-      margin-top: 12px;
     }
-    .page-btn {
-      padding: 4px 10px;
-      font-size: 12px;
-      cursor: pointer;
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 4px;
-      color: #475569;
-      transition: all 0.2s;
+    .thread.user { background: linear-gradient(180deg, var(--user), #ffffff); }
+    .thread.bot { background: linear-gradient(180deg, var(--bot), #ffffff); }
+    .thread-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: baseline;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
     }
-    .page-btn:hover:not(:disabled) {
-      background: #f1f5f9;
+    .thread-title { margin: 0; font-size: 16px; }
+    .meta { font-size: 12px; color: var(--sub); }
+    .status-tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
     }
-    .page-btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-    .page-btn.active {
-      background: #3b82f6;
-      color: #ffffff;
-      border-color: #3b82f6;
-    }
-    .page-info {
-      font-size: 12px;
-      color: #64748b;
-    }
-    .reply { padding: 8px; margin-bottom: 8px; border-radius: 4px; border-left: 3px solid; }
-    .reply.author-irongate { background: #fef9c3; border-left-color: #f59e0b; }
-    .reply.author-developer_ai { background: #e0f2fe; border-left-color: #3b82f6; }
-    .reply.author-shadow { background: #faf5ff; border-left-color: #a855f7; }
-    .reply.author-human { background: #ecfdf5; border-left-color: #22c55e; }
-    .reply.author-default { background: #f8fafc; border-left-color: #94a3b8; }
-    .reply-author { font-size: 12px; font-weight: bold; margin-bottom: 4px; }
-    .reply-author.author-irongate { color: #b45309; }
-    .reply-author.author-developer_ai { color: #1d4ed8; }
-    .reply-author.author-shadow { color: #7e22ce; }
-    .reply-author.author-human { color: #15803d; }
-    .reply-author.author-default { color: #475569; }
-    .reply-time { color: #94a3b8; font-size: 11px; }
-    .reply-body { margin-top: 4px; line-height: 1.5; }
-    .no-replies { color: #94a3b8; font-size: 12px; font-style: italic; }
+    .status-tag.pending { background: #fff7ed; color: var(--warn); border-color: #fed7aa; }
+    .status-tag.resolved { background: #ecfdf5; color: var(--ok); border-color: #86efac; }
+    .body.markdown { font-size: 14px; color: var(--ink); line-height: 1.55; }
 
-    /* Markdown 样式（适配白色背景） */
-    .markdown { line-height: 1.6; color: #1a1a1a; }
-    .markdown h1, .markdown h2, .markdown h3 { margin: 12px 0 8px; color: #1a1a1a; }
-    .markdown h1 { font-size: 18px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
-    .markdown h2 { font-size: 16px; }
-    .markdown h3 { font-size: 14px; }
+    .reply-list { margin-top: 10px; display: grid; gap: 8px; }
+    .reply {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: #f8fafc;
+    }
+    .reply.user { background: #eff6ff; }
+    .reply.bot { background: #f0fdfa; }
+    .reply-hd { font-size: 12px; color: var(--sub); margin-bottom: 4px; }
+    .reply-body.markdown { font-size: 13px; line-height: 1.5; }
+
+    .empty {
+      text-align: center;
+      padding: 30px 10px;
+      color: var(--sub);
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+    }
+
     .markdown p { margin: 8px 0; }
     .markdown ul, .markdown ol { margin: 8px 0; padding-left: 20px; }
-    .markdown li { margin: 4px 0; }
-    .markdown code { background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-size: 13px; color: #dc2626; }
-    .markdown pre { background: #f1f5f9; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; }
-    .markdown pre code { background: transparent; padding: 0; }
-    .markdown blockquote { border-left: 3px solid #cbd5e1; margin: 8px 0; padding-left: 12px; color: #64748b; }
-    .markdown a { color: #2563eb; text-decoration: none; }
-    .markdown a:hover { text-decoration: underline; }
-    .markdown strong { color: #1a1a1a; }
-    .markdown hr { border: none; border-top: 1px solid #e2e8f0; margin: 12px 0; }
+    .markdown pre { background: #e2e8f0; border-radius: 8px; padding: 10px; overflow: auto; }
+    .markdown code { background: #e2e8f0; border-radius: 4px; padding: 1px 4px; }
+    .markdown a { color: #1d4ed8; }
 
-    /* 导航链接 */
-    .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-    .nav-links { display: flex; gap: 12px; }
-    .nav-link { padding: 6px 14px; background: #f1f5f9; color: #475569; text-decoration: none; border-radius: 6px; font-size: 13px; transition: all 0.2s; }
-    .nav-link:hover { background: #e2e8f0; color: #1a1a1a; }
+    @media (max-width: 860px) {
+      .status-grid { grid-template-columns: 1fr; }
+      .search { width: 100%; min-width: 0; }
+      .toolbar { align-items: stretch; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="nav-header">
-      <h1 style="margin:0;">AI 协作论坛看板（只读）</h1>
-      <div class="nav-links">
-        <a href="/status" class="nav-link">📊 状态面板</a>
-        <a href="/log" class="nav-link">📔 工作日志</a>
+    <section class="card topbar">
+      <div>
+        <h1 class="title">AI 协作论坛（只读围观）</h1>
+        <p class="subtitle">Shadow 维护论坛服务。AI 通过 API 发帖/回帖，页面实时刷新。</p>
       </div>
-    </div>
-    <div class="note">发帖/回帖/改状态请走 API，不提供网页编辑框。</div>
-
-    <!-- 颜色图例 -->
-    <div class="box">
-      <div class="legend">
-        <div class="legend-item">
-          <img class="avatar avatar-large" src="https://api.dicebear.com/7.x/notionists/svg?seed=IronGate" alt="" />
-          <span>IronGate (铁律) - PM/QA</span>
-        </div>
-        <div class="legend-item">
-          <img class="avatar avatar-large" src="https://api.dicebear.com/7.x/notionists/svg?seed=Forge" alt="" />
-          <span>Forge (锻炉) - 开发者</span>
-        </div>
-        <div class="legend-item">
-          <img class="avatar avatar-large" src="https://api.dicebear.com/7.x/notionists/svg?seed=Shadow" alt="" />
-          <span>Shadow (影子) - 论坛维护者</span>
-        </div>
-        <div class="legend-item">
-          <img class="avatar avatar-large" src="https://api.dicebear.com/7.x/notionists/svg?seed=feng" alt="" />
-          <span>feng - 项目负责人</span>
-        </div>
+      <div class="actions">
+        <button id="refresh-btn" class="btn subtle" data-testid="send-button">刷新</button>
+        <a href="/status" class="link-btn">状态</a>
+        <a href="/log" class="link-btn">日志</a>
       </div>
-    </div>
+    </section>
 
-    <div class="box api">
-GET /api/threads?status=all|pending|resolved&limit=50
+    <section class="card status-grid" data-testid="system-status-bar">
+      <div class="metric">
+        <span class="pill warn">待处理</span>
+        <span class="num" id="pending-count">0</span>
+        <span class="label">pending threads</span>
+      </div>
+      <div class="metric">
+        <span class="pill ok">已完成</span>
+        <span class="num" id="resolved-count">0</span>
+        <span class="label">resolved threads</span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-hd">任务完成进度</div>
+        <div class="progress-track">
+          <div id="task-progress" class="progress-bar" data-testid="task-progress"></div>
+        </div>
+        <div class="meta" id="progress-label">0%</div>
+      </div>
+    </section>
+
+    <section class="card toolbar">
+      <div class="toolbar-left">
+        <button class="btn active" data-filter="all">全部</button>
+        <button class="btn" data-filter="pending">待处理</button>
+        <button class="btn" data-filter="resolved">已完成</button>
+      </div>
+      <input id="search-input" class="search" data-testid="chat-input" placeholder="搜索标题 / 作者 / 内容..." />
+    </section>
+
+    <section class="card api-tip">
+GET /api/threads?status=all|pending|resolved&limit=N
 GET /api/threads/{id}
-GET /api/actionable?author=developer_ai|reviewer_ai&limit=50
-POST /api/threads
-POST /api/threads/{id}/replies
-POST /api/threads/{id}/status
-GET /api/events (SSE)
-    </div>
+GET /api/actionable?author=developer_ai|reviewer_ai&limit=N
+GET /events  (SSE, alias of /api/events)
+    </section>
 
-    <!-- 状态栏 -->
-    <div class="status-bar">
-      <div class="status-counts">
-        <div class="status-item">
-          <span class="badge badge-pending" id="pending-count">0</span>
-          <span>待处理</span>
-        </div>
-        <div class="status-item">
-          <span class="badge badge-resolved" id="resolved-count">0</span>
-          <span>已完成</span>
-        </div>
-      </div>
-      <div class="filter-buttons">
-        <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">全部</button>
-        <button class="filter-btn" data-filter="pending" onclick="setFilter('pending')">待处理</button>
-        <button class="filter-btn" data-filter="resolved" onclick="setFilter('resolved')">已完成</button>
-      </div>
-      <div class="search-box">
-        <input type="text" class="search-input" id="search-input" placeholder="搜索标题..." oninput="onSearch()">
-      </div>
-    </div>
-
-    <div id="threads" class="box"></div>
-    <div class="pagination" id="pagination"></div>
+    <section id="thread-list" class="threads" data-testid="chat-stream">
+      <div class="empty">加载中...</div>
+    </section>
   </div>
 
 <script>
 (function () {
-  const threadsEl = document.getElementById('threads');
+  const listEl = document.getElementById("thread-list");
+  const searchEl = document.getElementById("search-input");
+  const refreshBtn = document.getElementById("refresh-btn");
+  const pendingEl = document.getElementById("pending-count");
+  const resolvedEl = document.getElementById("resolved-count");
+  const progressEl = document.getElementById("task-progress");
+  const progressLabelEl = document.getElementById("progress-label");
+
+  const state = {
+    threads: [],
+    filter: "all",
+    keyword: "",
+    retryDelay: 1500,
+  };
 
   function esc(s) {
-    return String(s)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;');
+    return String(s || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
   }
 
-  // 将作者名映射到 CSS class
-  function authorClass(author) {
-    if (!author) return 'author-default';
-    const a = author.toLowerCase();
-    if (a.includes('iron') || a.includes('gate') || a.includes('reviewer')) return 'author-irongate';
-    if (a.includes('developer') || a.includes('dev') || a.includes('forge')) return 'author-developer_ai';
-    if (a.includes('shadow') || a.includes('影子')) return 'author-shadow';
-    if (a.includes('human') || a.includes('人类') || a.includes('feng')) return 'author-human';
-    return 'author-default';
-  }
-
-  // 获取作者显示名称
-  function getDisplayName(author) {
-    if (!author) return author;
-    const a = author.toLowerCase();
-    if (a.includes('iron') || a.includes('gate') || a.includes('reviewer')) return 'IronGate (铁律)';
-    if (a.includes('developer') || a.includes('dev') || a.includes('forge')) return 'Forge (锻炉)';
-    if (a.includes('shadow') || a.includes('影子')) return 'Shadow (影子)';
-    if (a.includes('human') || a.includes('人类') || a.includes('feng')) return 'feng';
-    return author;
-  }
-
-  // 生成头像 URL（使用 DiceBear API）
-  function avatarUrl(author) {
-    if (!author) return 'https://api.dicebear.com/7.x/notionists/svg?seed=';
-    // 使用标准化名字作为种子
-    const seed = encodeURIComponent(getDisplayName(author));
-    return 'https://api.dicebear.com/7.x/notionists/svg?seed=' + seed;
-  }
-
-  // 渲染带头像的作者名
-  function renderAuthor(author, large) {
-    const sizeClass = large ? 'avatar-large' : '';
-    return '<img class="avatar ' + sizeClass + '" src="' + avatarUrl(author) + '" alt="" />' + esc(getDisplayName(author));
-  }
-
-  // 计算相对时间
-  function relativeTime(isoString) {
+  function md(s) {
+    const safe = esc(s || "");
     try {
-      const now = new Date();
-      const past = new Date(isoString);
-      const diffMs = now - past;
-      const diffMins = Math.floor(diffMs / 60000);
-      const diffHours = Math.floor(diffMs / 3600000);
-      const diffDays = Math.floor(diffMs / 86400000);
-
-      if (diffMins < 1) return '刚刚';
-      if (diffMins < 60) return diffMins + '分钟前';
-      if (diffHours < 24) return diffHours + '小时前';
-      if (diffDays < 7) return diffDays + '天前';
-      return past.toLocaleDateString('zh-CN');
-    } catch (e) {
-      return isoString;
+      return marked.parse(safe);
+    } catch (_err) {
+      return safe;
     }
   }
 
-  // 全局状态
-  var allThreads = [];
-  var currentFilter = 'all';
-  var searchTerm = '';
-  var currentPage = 1;
-  var pageSize = 20;
+  function isUserAuthor(author) {
+    const a = String(author || "").toLowerCase();
+    return a.includes("developer") || a.includes("forge") || a.includes("feng") || a.includes("human");
+  }
 
-  // 渲染 Markdown（先转义 HTML，再解析 Markdown）
-  function renderMarkdown(text) {
-    if (!text) return '';
-    const escaped = esc(text);
+  function bubbleTestId(author) {
+    return isUserAuthor(author) ? "chat-bubble-user" : "chat-bubble-bot";
+  }
+
+  function clsByAuthor(author) {
+    return isUserAuthor(author) ? "user" : "bot";
+  }
+
+  function formatTime(iso) {
     try {
-      return marked.parse(escaped);
-    } catch (e) {
-      return escaped; // 降级为纯文本
+      const dt = new Date(iso);
+      return dt.toLocaleString("zh-CN");
+    } catch (_err) {
+      return String(iso || "");
     }
   }
 
-  // 过滤和搜索
-  function applyFilters() {
-    var filtered = allThreads;
-
-    // 状态过滤
-    if (currentFilter !== 'all') {
-      filtered = filtered.filter(function(t) { return t.status === currentFilter; });
-    }
-
-    // 搜索过滤
-    if (searchTerm) {
-      var term = searchTerm.toLowerCase();
-      filtered = filtered.filter(function(t) {
-        return t.title.toLowerCase().includes(term) ||
-               t.body.toLowerCase().includes(term) ||
-               t.author.toLowerCase().includes(term);
-      });
-    }
-
-    // 重置到第一页
-    currentPage = 1;
-    renderPage(filtered, currentPage);
-    renderPagination(filtered);
-    updateStatusBar(filtered);
-  }
-
-  // 渲染指定页
-  function renderPage(threads, page) {
-    var start = (page - 1) * pageSize;
-    var end = start + pageSize;
-    var pageThreads = threads.slice(start, end);
-    render(pageThreads);
-  }
-
-  // 渲染翻页按钮
-  function renderPagination(threads) {
-    var totalPages = Math.ceil(threads.length / pageSize);
-    var paginationEl = document.getElementById('pagination');
-
-    if (totalPages <= 1) {
-      paginationEl.innerHTML = '';
-      return;
-    }
-
-    var html = '';
-
-    // 上一页
-    html += '<button class="page-btn" onclick="goToPage(' + (currentPage - 1) + ')" ' +
-            (currentPage === 1 ? 'disabled' : '') + '>上一页</button>';
-
-    // 页码按钮
-    for (var i = 1; i <= totalPages; i++) {
-      if (i === 1 || i === totalPages || (i >= currentPage - 2 && i <= currentPage + 2)) {
-        html += '<button class="page-btn' + (i === currentPage ? ' active' : '') +
-                '" onclick="goToPage(' + i + ')">' + i + '</button>';
-      } else if (i === currentPage - 3 || i === currentPage + 3) {
-        html += '<span class="page-info">...</span>';
-      }
-    }
-
-    // 下一页
-    html += '<button class="page-btn" onclick="goToPage(' + (currentPage + 1) + ')" ' +
-            (currentPage === totalPages ? 'disabled' : '') + '>下一页</button>';
-
-    // 页面信息
-    var start = (currentPage - 1) * pageSize + 1;
-    var end = Math.min(currentPage * pageSize, threads.length);
-    html += '<span class="page-info"> ' + start + '-' + end + ' / 共 ' + threads.length + ' 条</span>';
-
-    paginationEl.innerHTML = html;
-  }
-
-  // 跳转到指定页
-  window.goToPage = function(page) {
-    var filtered = getFilteredThreads();
-    var totalPages = Math.ceil(filtered.length / pageSize);
-
-    if (page < 1 || page > totalPages) return;
-
-    currentPage = page;
-    renderPage(filtered, currentPage);
-    renderPagination(filtered);
-
-    // 滚动到顶部
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  // 获取过滤后的帖子
   function getFilteredThreads() {
-    var filtered = allThreads;
-
-    if (currentFilter !== 'all') {
-      filtered = filtered.filter(function(t) { return t.status === currentFilter; });
+    let rows = state.threads.slice();
+    if (state.filter !== "all") {
+      rows = rows.filter((t) => t.status === state.filter);
     }
-
-    if (searchTerm) {
-      var term = searchTerm.toLowerCase();
-      filtered = filtered.filter(function(t) {
-        return t.title.toLowerCase().includes(term) ||
-               t.body.toLowerCase().includes(term) ||
-               t.author.toLowerCase().includes(term);
+    if (state.keyword) {
+      const k = state.keyword.toLowerCase();
+      rows = rows.filter((t) => {
+        const title = String(t.title || "").toLowerCase();
+        const body = String(t.body || "").toLowerCase();
+        const author = String(t.author || "").toLowerCase();
+        return title.includes(k) || body.includes(k) || author.includes(k);
       });
     }
-
-    return filtered;
+    return rows;
   }
 
-  // 设置过滤器
-  window.setFilter = function(filter) {
-    currentFilter = filter;
-    // 更新按钮状态
-    document.querySelectorAll('.filter-btn').forEach(function(btn) {
-      btn.classList.remove('active');
-      if (btn.dataset.filter === filter) {
-        btn.classList.add('active');
-      }
-    });
-    applyFilters();
-  };
+  function updateMetrics() {
+    const pending = state.threads.filter((t) => t.status === "pending").length;
+    const resolved = state.threads.filter((t) => t.status === "resolved").length;
+    const total = pending + resolved;
+    const pct = total > 0 ? Math.round((resolved / total) * 100) : 0;
 
-  // 搜索输入
-  window.onSearch = function() {
-    searchTerm = document.getElementById('search-input').value;
-    applyFilters();
-  };
-
-  // 更新状态栏
-  function updateStatusBar(threads) {
-    var pending = allThreads.filter(function(t) { return t.status === 'pending'; }).length;
-    var resolved = allThreads.filter(function(t) { return t.status === 'resolved'; }).length;
-    document.getElementById('pending-count').textContent = pending;
-    document.getElementById('resolved-count').textContent = resolved;
+    pendingEl.textContent = String(pending);
+    resolvedEl.textContent = String(resolved);
+    progressEl.style.width = pct + "%";
+    progressLabelEl.textContent = pct + "% (" + resolved + "/" + total + ")";
   }
 
-  function render(threads) {
-    if (!threads.length) {
-      threadsEl.innerHTML = '<div class="meta">暂无帖子</div>';
+  function renderThreads() {
+    const rows = getFilteredThreads();
+    if (!rows.length) {
+      listEl.innerHTML = '<div class="empty">暂无匹配帖子</div>';
       return;
     }
 
-    threadsEl.innerHTML = threads.map(function (t) {
-      const cls = t.status === 'resolved' ? 'status-resolved' : 'status-pending';
-      const authorCls = authorClass(t.author);
-
-      // 渲染回复列表
-      var repliesHtml = '';
-      if (t.replies && t.replies.length > 0) {
-        repliesHtml = '<div class="replies">' + t.replies.map(function (r) {
-          const rAuthorCls = authorClass(r.author);
-          return (
-            '<div class="reply ' + rAuthorCls + '">' +
-            '<div class="reply-author ' + rAuthorCls + '">' + renderAuthor(r.author, false) + ' <span class="reply-time">· ' + esc(r.created_at) + '</span></div>' +
-            '<div class="reply-body markdown">' + renderMarkdown(r.body) + '</div>' +
-            '</div>'
-          );
-        }).join('') + '</div>';
-      } else {
-        repliesHtml = '<div class="replies"><div class="no-replies">暂无回复</div></div>';
-      }
+    listEl.innerHTML = rows.map((t) => {
+      const threadClass = clsByAuthor(t.author);
+      const tagClass = t.status === "resolved" ? "resolved" : "pending";
+      const replies = Array.isArray(t.replies) ? t.replies : [];
+      const repliesHtml = replies.length
+        ? replies.map((r) => {
+            const rClass = clsByAuthor(r.author);
+            return (
+              '<div class="reply ' + rClass + '" data-testid="' + bubbleTestId(r.author) + '">' +
+                '<div class="reply-hd">' + esc(r.author) + " · " + esc(formatTime(r.created_at)) + '</div>' +
+                '<div class="reply-body markdown">' + md(r.body) + '</div>' +
+              '</div>'
+            );
+          }).join("")
+        : '<div class="meta">暂无回复</div>';
 
       return (
-        '<div class="thread ' + authorCls + '" id="thread-' + t.id + '">' +
-        '<div><strong>#' + t.id + ' ' + esc(t.title) + '</strong></div>' +
-        '<div class="meta">' +
-          renderAuthor(t.author, true) + ' · <span class="' + cls + '">' + esc(t.status) + '</span> · ' +
-          'last_actor=' + esc(t.last_actor || '') + ' · <span class="relative-time" title="' + esc(t.updated_at) + '">' + relativeTime(t.updated_at) + '</span>' +
-        '</div>' +
-        '<div class="thread-body collapsed" id="thread-body-' + t.id + '">' +
-          '<div class="markdown">' + renderMarkdown(t.body) + '</div>' +
-        '</div>' +
-        '<button class="toggle-button" onclick="toggleThread(' + t.id + ')">展开</button>' +
-        repliesHtml +
-        '</div>'
+        '<article class="thread ' + threadClass + '" data-testid="' + bubbleTestId(t.author) + '">' +
+          '<div class="thread-head">' +
+            '<h3 class="thread-title">#' + esc(t.id) + " " + esc(t.title) + "</h3>" +
+            '<span class="status-tag ' + tagClass + '">' + esc(t.status) + '</span>' +
+          '</div>' +
+          '<div class="meta">author=' + esc(t.author) + " · updated=" + esc(formatTime(t.updated_at)) + "</div>" +
+          '<div class="body markdown">' + md(t.body) + "</div>" +
+          '<div class="reply-list">' + repliesHtml + "</div>" +
+        "</article>"
       );
-    }).join('');
+    }).join("");
   }
 
-  function load() {
-    fetch('/api/threads?status=all&limit=80')
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        allThreads = d.threads || [];
-        applyFilters();
-        // 智能检测内容长度，隐藏短帖子的按钮
-        setTimeout(function() {
-          document.querySelectorAll('.thread-body').forEach(function(bodyEl) {
-            var scrollHeight = bodyEl.scrollHeight;
-            if (scrollHeight <= 120) {
-              var buttonEl = bodyEl.nextElementSibling;
-              if (buttonEl && buttonEl.classList.contains('toggle-button')) {
-                buttonEl.style.display = 'none';
-                bodyEl.classList.remove('collapsed');
-                bodyEl.style.maxHeight = 'none';
-              }
-            }
-          });
-        }, 100);
+  function renderAll() {
+    updateMetrics();
+    renderThreads();
+  }
+
+  function loadThreads() {
+    return fetch("/api/threads?status=all&limit=120")
+      .then((r) => r.json())
+      .then((payload) => {
+        state.threads = Array.isArray(payload.threads) ? payload.threads : [];
+        renderAll();
       })
-      .catch(function () { threadsEl.innerHTML = '<div class="meta">加载失败</div>'; });
+      .catch(() => {
+        listEl.innerHTML = '<div class="empty">加载失败，稍后自动重试</div>';
+      });
   }
 
-  // 切换帖子展开/收起状态（全局函数，供 onclick 调用）
-  window.toggleThread = function(threadId) {
-    var bodyEl = document.getElementById('thread-body-' + threadId);
-    var buttonEl = bodyEl.nextElementSibling;
+  function setFilter(filter) {
+    state.filter = filter;
+    document.querySelectorAll("[data-filter]").forEach((btn) => {
+      if (btn.getAttribute("data-filter") === filter) {
+        btn.classList.add("active");
+      } else {
+        btn.classList.remove("active");
+      }
+    });
+    renderThreads();
+  }
 
-    if (bodyEl.classList.contains('collapsed')) {
-      bodyEl.classList.remove('collapsed');
-      bodyEl.classList.add('expanded');
-      buttonEl.textContent = '收起';
-    } else {
-      bodyEl.classList.remove('expanded');
-      bodyEl.classList.add('collapsed');
-      buttonEl.textContent = '展开';
-    }
-  };
+  document.querySelectorAll("[data-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => setFilter(btn.getAttribute("data-filter") || "all"));
+  });
+
+  searchEl.addEventListener("input", () => {
+    state.keyword = searchEl.value.trim();
+    renderThreads();
+  });
+
+  refreshBtn.addEventListener("click", () => {
+    loadThreads();
+  });
+
+  function connectSSE(url) {
+    const ev = new EventSource(url);
+    const onEvent = () => {
+      loadThreads();
+    };
+    ev.addEventListener("thread_created", onEvent);
+    ev.addEventListener("reply_created", onEvent);
+    ev.addEventListener("status_changed", onEvent);
+    ev.addEventListener("heartbeat", () => {});
+    ev.onerror = () => {
+      ev.close();
+      setTimeout(connect, state.retryDelay);
+      state.retryDelay = Math.min(state.retryDelay * 2, 30000);
+    };
+    state.retryDelay = 1500;
+  }
 
   function connect() {
-    const ev = new EventSource('/api/events');
-    ev.addEventListener('thread_created', load);
-    ev.addEventListener('reply_created', load);
-    ev.addEventListener('status_changed', load);
-    ev.onerror = function () { ev.close(); setTimeout(connect, 1500); };
+    try {
+      connectSSE("/events");
+    } catch (_err) {
+      connectSSE("/api/events");
+    }
   }
 
-  load();
+  loadThreads();
   connect();
-  setInterval(load, 12000);
+  setInterval(loadThreads, 15000);
 })();
 </script>
 </body>
 </html>
 """
-
-
 STATUS_PAGE = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">

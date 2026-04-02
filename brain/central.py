@@ -9,10 +9,13 @@ import base64
 import json
 import logging
 import os
+import random
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Tuple
 
 from limbs import hub as limbs_hub
 from brain import tool_quality as tool_quality_mod
@@ -44,76 +47,237 @@ def init(models_config, workspace, owner_id, sessions_dir):
 #  LLM API Call
 # ============================================================
 
+_RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _sanitize_int(value: Any, default: int, minimum: int = 1) -> int:
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return default
+    if ivalue < minimum:
+        return default
+    return ivalue
+
+
+def _sanitize_float(value: Any, default: float, minimum: float = 0.0) -> float:
+    try:
+        fvalue = float(value)
+    except (TypeError, ValueError):
+        return default
+    if fvalue < minimum:
+        return default
+    return fvalue
+
+
+def _resolve_provider_chain() -> List[Tuple[str, Dict[str, Any]]]:
+    providers = _config.get("providers", {})
+    if isinstance(providers, dict) and providers:
+        ordered_names: List[str] = []
+        default_name = _config.get("default")
+        if isinstance(default_name, str) and default_name in providers:
+            ordered_names.append(default_name)
+        else:
+            ordered_names.append(next(iter(providers)))
+
+        primary_provider = providers[ordered_names[0]]
+        failover_sources = [
+            _config.get("failover"),
+            _config.get("fallback"),
+            primary_provider.get("failover_providers"),
+            primary_provider.get("fallback_providers"),
+        ]
+        for source in failover_sources:
+            if not isinstance(source, list):
+                continue
+            for provider_name in source:
+                if isinstance(provider_name, str) and provider_name in providers and provider_name not in ordered_names:
+                    ordered_names.append(provider_name)
+
+        for provider_name in providers:
+            if provider_name not in ordered_names:
+                ordered_names.append(provider_name)
+
+        return [(name, providers[name]) for name in ordered_names]
+
+    # Backward compatibility for tests / legacy configs:
+    # {"default": { ... provider config ... }}
+    legacy_default = _config.get("default")
+    if isinstance(legacy_default, dict):
+        return [("default", legacy_default)]
+
+    raise ValueError("Invalid models config: expected providers map or legacy default provider dict")
+
+
 def _get_provider():
-    default_name = _config["default"]
-    return _config["providers"][default_name]
+    return _resolve_provider_chain()[0][1]
 
 
-def _call_llm(messages, tool_defs):
-    provider = _get_provider()
-    
-    # 1. Determine URL and Headers based on provider type
+def _build_request_payload(provider: Dict[str, Any], messages: List[Dict[str, Any]], tool_defs: List[Dict[str, Any]]) -> Tuple[str, Dict[str, str], Dict[str, Any], int]:
     if provider.get("type") == "azure":
         # Azure format: {endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}
-        endpoint = provider["api_base"].rstrip("/")
+        endpoint = str(provider["api_base"]).rstrip("/")
         deployment = provider["deployment_name"]
         version = provider.get("api_version", "2024-05-01-preview")
         url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={version}"
-        
+
         headers = {
             "Content-Type": "application/json",
             "api-key": provider["api_key"],
         }
     else:
-        # Standard OpenAI format
-        url = provider["api_base"].rstrip("/") + "/chat/completions"
+        # Standard OpenAI-compatible format
+        url = str(provider["api_base"]).rstrip("/") + "/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {provider['api_key']}",
         }
 
-    # 2. Build request body
-    body = {
-        "messages": messages,
-    }
-    
+    body: Dict[str, Any] = {"messages": messages}
     if tool_defs:
         body["tools"] = tool_defs
-        
+
     # Default/cap max_tokens to improve compatibility across Azure deployments.
-    configured_max_tokens = provider.get("max_tokens", 4000)
-    try:
-        configured_max_tokens = int(configured_max_tokens)
-    except (TypeError, ValueError):
-        configured_max_tokens = 4000
-    if configured_max_tokens <= 0:
-        configured_max_tokens = 4000
+    configured_max_tokens = _sanitize_int(provider.get("max_tokens", 4000), 4000, minimum=1)
     body["max_tokens"] = min(configured_max_tokens, 4000)
-        
-    # Standard OpenAI requires 'model', but Azure embeds it in the URL
+
+    # Standard OpenAI requires 'model', but Azure embeds deployment in URL.
     if provider.get("type") != "azure":
         body["model"] = provider.get("model", "gpt-3.5-turbo")
-        
-    extra = provider.get("extra_body", {})
-    body.update(extra)
 
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers)
-    timeout = provider.get("timeout", 120)
+    extra = provider.get("extra_body", {})
+    if isinstance(extra, dict):
+        body.update(extra)
+
+    timeout = _sanitize_int(provider.get("timeout", 120), 120, minimum=1)
+    return url, headers, body, timeout
+
+
+def _retry_config(provider: Dict[str, Any]) -> Tuple[int, float, float, float]:
+    global_retry = _config.get("retry", {})
+    if not isinstance(global_retry, dict):
+        global_retry = {}
+    provider_retry = provider.get("retry", {})
+    if not isinstance(provider_retry, dict):
+        provider_retry = {}
+
+    max_attempts = _sanitize_int(
+        provider_retry.get(
+            "max_attempts",
+            provider.get(
+                "max_attempts",
+                global_retry.get("max_attempts", 2),
+            ),
+        ),
+        2,
+        minimum=1,
+    )
+    base_delay = _sanitize_float(
+        provider_retry.get(
+            "base_delay_sec",
+            provider.get(
+                "retry_base_delay_sec",
+                global_retry.get("base_delay_sec", 0.8),
+            ),
+        ),
+        0.8,
+        minimum=0.0,
+    )
+    max_delay = _sanitize_float(
+        provider_retry.get(
+            "max_delay_sec",
+            provider.get(
+                "retry_max_delay_sec",
+                global_retry.get("max_delay_sec", 8.0),
+            ),
+        ),
+        8.0,
+        minimum=base_delay if base_delay > 0 else 0.1,
+    )
+    jitter = _sanitize_float(
+        provider_retry.get(
+            "jitter_sec",
+            provider.get(
+                "retry_jitter_sec",
+                global_retry.get("jitter_sec", 0.2),
+            ),
+        ),
+        0.2,
+        minimum=0.0,
+    )
+    if max_delay < base_delay:
+        max_delay = base_delay
+    return max_attempts, base_delay, max_delay, jitter
+
+
+def _compute_backoff(attempt: int, base_delay: float, max_delay: float, jitter: float) -> float:
+    delay = min(max_delay, base_delay * (2 ** max(0, attempt - 1)))
+    if jitter > 0:
+        delay += random.uniform(0.0, jitter)
+    return max(0.0, delay)
+
+
+def _http_error_text(err: urllib.error.HTTPError) -> str:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        # Read response body for debugging 400/422 errors
-        body_text = ""
-        try:
-            body_text = e.read().decode("utf-8", errors="replace")[:1000]
-        except Exception:
-            pass
-        log.error(f"[llm] HTTP {e.code}: {body_text}")
-        log.error(f"[llm] Request URL: {url}")
-        log.error(f"[llm] Request Body: {json.dumps(body, ensure_ascii=False)[:2000]}")
-        raise
+        return err.read().decode("utf-8", errors="replace")[:1000]
+    except Exception:
+        return ""
+
+
+def _call_llm(messages, tool_defs):
+    provider_chain = _resolve_provider_chain()
+    last_error: Exception | None = None
+
+    for idx, (provider_name, provider) in enumerate(provider_chain):
+        max_attempts, base_delay, max_delay, jitter = _retry_config(provider)
+
+        for attempt in range(1, max_attempts + 1):
+            url, headers, body, timeout = _build_request_payload(provider, messages, tool_defs)
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                body_text = _http_error_text(e)
+                log.error("[llm] provider=%s attempt=%s/%s HTTP %s: %s", provider_name, attempt, max_attempts, e.code, body_text)
+                log.error("[llm] Request URL: %s", url)
+                log.error("[llm] Request Body: %s", json.dumps(body, ensure_ascii=False)[:2000])
+                last_error = e
+
+                should_retry = e.code in _RETRYABLE_HTTP_CODES and attempt < max_attempts
+                if should_retry:
+                    delay = _compute_backoff(attempt, base_delay, max_delay, jitter)
+                    log.warning("[llm] retry provider=%s in %.2fs (HTTP %s)", provider_name, delay, e.code)
+                    time.sleep(delay)
+                    continue
+                break
+            except urllib.error.URLError as e:
+                log.error("[llm] provider=%s attempt=%s/%s URLError: %s", provider_name, attempt, max_attempts, e)
+                last_error = e
+                if attempt < max_attempts:
+                    delay = _compute_backoff(attempt, base_delay, max_delay, jitter)
+                    log.warning("[llm] retry provider=%s in %.2fs (network)", provider_name, delay)
+                    time.sleep(delay)
+                    continue
+                break
+            except TimeoutError as e:
+                log.error("[llm] provider=%s attempt=%s/%s timeout: %s", provider_name, attempt, max_attempts, e)
+                last_error = e
+                if attempt < max_attempts:
+                    delay = _compute_backoff(attempt, base_delay, max_delay, jitter)
+                    log.warning("[llm] retry provider=%s in %.2fs (timeout)", provider_name, delay)
+                    time.sleep(delay)
+                    continue
+                break
+
+        if idx < len(provider_chain) - 1:
+            next_name = provider_chain[idx + 1][0]
+            log.warning("[llm] failover from provider '%s' to '%s'", provider_name, next_name)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("LLM call failed without explicit exception")
 
 
 # ============================================================

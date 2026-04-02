@@ -85,6 +85,27 @@ def _ensure_daily_self_repair_schedule():
 
 _ensure_daily_self_repair_schedule()
 
+
+FORUM_MONITOR_JOB_NAME = "forum_health_monitor"
+FORUM_MONITOR_CRON_EXPR = "*/2 * * * *"  # 每2分钟
+
+def _ensure_forum_monitor_schedule():
+    """Ensure forum health monitor runs every 2 minutes."""
+    try:
+        result = scheduler.add(
+            {
+                "name": FORUM_MONITOR_JOB_NAME,
+                "message": "检查论坛健康状态并自动修复",
+                "cron_expr": FORUM_MONITOR_CRON_EXPR,
+                "once": False,
+            }
+        )
+        log.info("[boot] ensured forum monitor schedule: %s", result)
+    except Exception as exc:
+        log.error("[boot] failed to ensure forum monitor schedule: %s", exc, exc_info=True)
+
+_ensure_forum_monitor_schedule()
+
 _RECENT_ERROR_LOCK = threading.Lock()
 _RECENT_ERROR = None
 
